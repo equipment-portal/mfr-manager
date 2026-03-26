@@ -90,15 +90,7 @@ if 'initialized' not in st.session_state:
 # --- UI：サイドバー ---
 with st.sidebar:
     st.header("⚙️ システム管理")
-    st.write("システムを使い終わる際や、完全に終了したい場合は以下のボタンを押してください。")
-    if st.button("🛑 システムを完全に終了する"):
-        import time as sys_time
-        st.success("システムを停止しました。右上の「×」でこの画面を閉じてください。")
-        sys_time.sleep(2)
-        import os
-        os._exit(0)
         
-    st.markdown("---")
     st.subheader("📦 製品マスター管理")
     with st.expander("製品の登録・編集・削除", expanded=False):
         with st.form("product_form"):
