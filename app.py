@@ -85,11 +85,20 @@ if 'initialized' not in st.session_state:
         st.session_state.shown_alerts = []
     st.session_state.initialized = True
     st.session_state.inspection_dialog_shown = False 
+    # pygame.mixer.init() は削除
 
 # --- UI：サイドバー ---
 with st.sidebar:
     st.header("⚙️ システム管理")
+    st.write("システムを使い終わる際や、完全に終了したい場合は以下のボタンを押してください。")
+    if st.button("🛑 システムを完全に終了する"):
+        import time as sys_time
+        st.success("システムを停止しました。右上の「×」でこの画面を閉じてください。")
+        sys_time.sleep(2)
+        import os
+        os._exit(0)
         
+    st.markdown("---")
     st.subheader("📦 製品マスター管理")
     with st.expander("製品の登録・編集・削除", expanded=False):
         with st.form("product_form"):
@@ -180,6 +189,7 @@ if valid_upcoming:
 
 # --- アラーム・ダイアログ通知 ---
 
+# 【修正後：クラウド対応版のアラーム通知】
 # 1. 始業時点検確認
 inspection_start_time = datetime.combine(today_date, dt_time(7, 0, 0))
 inspection_end_time = datetime.combine(today_date, dt_time(10, 0, 0))
@@ -192,6 +202,7 @@ if st.session_state.last_inspection_date != today_date:
     elif inspection_start_time <= now < inspection_end_time:
         if not st.session_state.get('inspection_dialog_shown', False):
             st.session_state.inspection_dialog_shown = True
+            # クラウド用にポップアップをブラウザ通知(toast)に変更
             st.toast("📋 本日の日常点検（MFR測定）は既に完了していますか？下部のボタンから記録してください。", icon="⚠️")
 
 # 2. 測定実行のアラーム
@@ -208,7 +219,7 @@ for pt in valid_upcoming:
 
         if alert_id_meas not in st.session_state.shown_alerts:
             st.session_state.shown_alerts.append(alert_id_meas); save_state()
-            st.toast(msg_meas, icon="🚨") 
+            st.toast(msg_meas, icon="🚨") # クラウド用通知
 
 # 3. 電源ON・OFFアラーム
 for b_start, b_end in on_blocks:
@@ -230,7 +241,9 @@ for b_start, b_end in on_blocks:
 # --- UI：ヘッダー ---
 try:
     logo_base64 = get_image_base64(logo_path)
-    logo_html = f"""<div style="display: flex; align-items: flex-end; gap: 15px; margin-bottom: 10px;"><img src="data:image/png;base64,{logo_base64}" width="100px"><h1 style="margin: 0; color: #1f2937; line-height: 0.9; position: relative; top: 8px;">MFRスマート電源管理システム</h1></div>"""
+    # 【変更】align-items を flex-end にし、line-heightを調整して文字とアイコンの底辺をピタッと合わせる
+    # 【変更】「position: relative; top: 8px;」を追加して、文字だけを強制的に下に8ピクセル押し下げます
+    logo_html = f"""<div style="display: flex; align-items: flex-end; gap: 15px; margin-bottom: 10px;"><img src="data:image/png;base64,{logo_base64}" width="100px"><h1 style="margin: 0; color: #1f2937; line-height: 0.9; position: relative; top: 12px;">MFRスマート電源管理システム</h1></div>"""
     st.markdown(logo_html, unsafe_allow_html=True)
 except:
     st.title("MFRスマート電源管理システム")
@@ -242,17 +255,24 @@ st.markdown("---")
 st.subheader("💡 MFR測定器 電源ステータス")
 is_monday = (today_date.weekday() == 0)
 
+# 時刻判定用の定数を定義（日常点検表示用）
 inspection_start_time = datetime.combine(today_date, dt_time(7, 0, 0))
 inspection_end_time = datetime.combine(today_date, dt_time(10, 0, 0))
 
 if st.session_state.last_inspection_date == today_date:
     st.success("✅ 本日の日常点検は完了しています。")
 else:
+    # 点検未完了の場合の表示ロジック（7-10時のみ赤色エラー、それ以外は黄色警告）
+    
+    # 7:00 ～ 10:00の間のみ、赤色のエラー警告（st.error）と完了ボタンを表示
     if inspection_start_time <= now < inspection_end_time:
         if is_monday: st.error("⚠️ 【至急】本日の日常点検が未完了です！ MFR電源をONにして点検を実施してください。（月曜は朝8:00）")
         else: st.error("⚠️ 【至急】本日の日常点検が未完了です！ MFR電源をONにして点検を実施してください。（火〜金は朝7:00）")
         if st.button("📝 点検が終わったので完了を記録する"):
             st.session_state.last_inspection_date = today_date; save_state(); st.rerun()
+            
+    # 0:00 ～ 6:59の間は、未点検だが警告（st.error）は使わない。 st.warning か st.info
+    # (10:00以降は自動完了 rerun 済みなのでここには来ない)
     elif now < inspection_start_time:
         if is_monday: st.warning("📋 本日の日常点検が未完了です。（月曜は朝8:00開始）")
         else: st.warning("📋 本日の日常点検が未完了です。（火〜金は朝7:00開始）")
@@ -671,11 +691,14 @@ with st.expander("📊 現在のスケジュールにおける削減効果金額
 
             import math
             # --- デザインの良い矢印への変更（動的アングル計算） ---
-            approx_dx_px = 500  
-            approx_dy_px = ((total_old - total_new) / (total_old * 1.5)) * 400 
+            # グラフの描画領域の仮のピクセルサイズから、頂点同士を結ぶ線の傾斜角度を自動計算します
+            approx_dx_px = 500  # 棒間の横のピクセル距離（概算）
+            approx_dy_px = ((total_old - total_new) / (total_old * 1.5)) * 400 # 縦のピクセル距離（概算）
             
+            # 修正箇所: 角度が逆（上向き）になっていたため、マイナスを外して正しい方向（右下）へ傾斜させます！
             angle_deg = int(math.degrees(math.atan2(approx_dy_px, approx_dx_px)))
 
+            # 棒と棒の中間（高さもピッタリ中間）に、計算した角度で矢印を配置
             fig_eco.add_annotation(
                 x=0.5, y=(total_old + total_new) / 2, xref="paper", yref="y",
                 text="<span style='font-size: 80px; color: #e63946; text-shadow: 2px 2px 3px rgba(0,0,0,0.2);'>➡</span>",
@@ -683,8 +706,10 @@ with st.expander("📊 現在のスケジュールにおける削減効果金額
                 textangle=angle_deg 
             )
             
+            # 節約金額の特大バッジを、グラフの中間（x=0.5）の最上部に配置
             fig_eco.add_annotation(
                 x=0.5, y=total_old * 1.15, xref="paper", yref="y", yanchor="bottom", 
+                # バッジ内の改行・重なり解消
                 text=f"<b>✨ 削減効果</b><br><br><b><span style='font-size:42px; color:#d00000;'>▲ {int(saved_total):,} 円</span></b>",
                 showarrow=False,
                 font=dict(size=22, color="#111"),
