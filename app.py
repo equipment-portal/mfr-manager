@@ -128,7 +128,7 @@ with st.sidebar:
         save_state(); st.rerun()
 
 # --- 事前計算ロジック ---
-now = datetime.now()
+now = (datetime.utcnow() + timedelta(hours=9))
 today_date = now.date()
 
 def calculate_upcoming_measurements():
@@ -241,7 +241,8 @@ for b_start, b_end in on_blocks:
 # --- UI：ヘッダー ---
 try:
     logo_base64 = get_image_base64(logo_path)
-    logo_html = f"""<div style="display: flex; align-items: center; gap: 15px;"><img src="data:image/png;base64,{logo_base64}" width="100px"><div><h1 style="margin: 0; color: #1f2937;">MFRスマート電源管理システム</h1></div></div>"""
+    # 【変更】align-items を flex-end にし、line-heightを調整して文字とアイコンの底辺をピタッと合わせる
+    logo_html = f"""<div style="display: flex; align-items: flex-end; gap: 15px; margin-bottom: 10px;"><img src="data:image/png;base64,{logo_base64}" width="100px"><h1 style="margin: 0; color: #1f2937; line-height: 0.9;">MFRスマート電源管理システム</h1></div>"""
     st.markdown(logo_html, unsafe_allow_html=True)
 except:
     st.title("MFRスマート電源管理システム")
@@ -322,7 +323,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 if st.button("▶️ 生産スタート", key=f"start_btn_{machine}"):
                     st.session_state.jobs[machine] = {
                         'product_name': product_name, 'total_qty': total_qty, 'cycle_time': cycle_time,
-                        'current_qty': current_qty, 'last_update': datetime.now(),
+                        'current_qty': current_qty, 'last_update': (datetime.utcnow() + timedelta(hours=9)),
                         'targets': targets, 'completed': completed, 'status': 'Running'
                     }
                     save_state(); st.rerun()
@@ -333,7 +334,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
             st.write(f"製品: **{p_name}** ({job['total_qty']}個 / サイクル: {job['cycle_time']}秒)")
 
             if job['status'] == 'Running':
-                elapsed_sec = (datetime.now() - job['last_update']).total_seconds()
+                elapsed_sec = ((datetime.utcnow() + timedelta(hours=9)) - job['last_update']).total_seconds()
                 est_current = min(int(job['current_qty'] + (elapsed_sec / job['cycle_time'])), job['total_qty'])
             else:
                 est_current = job['current_qty']
@@ -348,7 +349,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                             job['current_qty'] = est_current; job['status'] = 'Paused'; save_state(); st.rerun()
                     elif job['status'] == 'Paused':
                         if st.button("▶️ 再開", key=f"resume_main_{machine}"):
-                            job['last_update'] = datetime.now(); job['status'] = 'Running'; save_state(); st.rerun()
+                            job['last_update'] = (datetime.utcnow() + timedelta(hours=9)); job['status'] = 'Running'; save_state(); st.rerun()
                 with col_ctrl2:
                     if st.button("⏹️ 生産終了", key=f"stop_main_{machine}"):
                         st.session_state.jobs[machine] = None; save_state(); st.rerun()
@@ -366,9 +367,9 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 else:
                     if st.button(f"🎯 {meas_text} ー 測定完了を記録", key=f"comp_{machine}_{t}"):
                         if job['status'] == 'Running':
-                            elapsed_sec = (datetime.now() - job['last_update']).total_seconds()
+                            elapsed_sec = ((datetime.utcnow() + timedelta(hours=9)) - job['last_update']).total_seconds()
                             job['current_qty'] = min(int(job['current_qty'] + (elapsed_sec / job['cycle_time'])), job['total_qty'])
-                            job['last_update'] = datetime.now()
+                            job['last_update'] = (datetime.utcnow() + timedelta(hours=9))
                             
                         job['completed'].append(t)
                         if len(job['completed']) == len(job['targets']): 
@@ -395,7 +396,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
             if st.button("💾 個数を上書き更新", key=f"update_qty_{machine}"):
                 if job is not None:
                     job['current_qty'] = new_qty
-                    job['last_update'] = datetime.now()
+                    job['last_update'] = (datetime.utcnow() + timedelta(hours=9))
                     save_state(); st.rerun()
                 else:
                     st.warning("稼働していません。")
@@ -408,7 +409,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 if job is not None:
                     job['current_qty'] = est_current 
                     job['cycle_time'] = new_cycle
-                    job['last_update'] = datetime.now()
+                    job['last_update'] = (datetime.utcnow() + timedelta(hours=9))
                     save_state(); st.rerun()
                 else:
                     st.warning("稼働していません。")
@@ -455,7 +456,7 @@ measurement_points = []
 for machine, job in st.session_state.jobs.items():
     if job is None: continue
     start_time = job['last_update']
-    end_time = datetime.now() if job['status'] == 'Completed' else job['last_update'] + timedelta(seconds=(job['total_qty'] - job['current_qty']) * job['cycle_time'])
+    end_time = (datetime.utcnow() + timedelta(hours=9)) if job['status'] == 'Completed' else job['last_update'] + timedelta(seconds=(job['total_qty'] - job['current_qty']) * job['cycle_time'])
     timeline_data.append({'Task': machine, 'Start': start_time, 'End': end_time, 'Status': job['status'], 'Targets': job['targets']})
 
     for t in job['targets']:
