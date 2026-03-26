@@ -89,7 +89,7 @@ if 'initialized' not in st.session_state:
 # --- UI：サイドバー ---
 with st.sidebar:
     st.header("⚙️ システム管理")
-    
+        
     st.subheader("📦 製品マスター管理")
     with st.expander("製品の登録・編集・削除", expanded=False):
         with st.form("product_form"):
