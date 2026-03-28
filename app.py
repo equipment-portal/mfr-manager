@@ -56,8 +56,8 @@ def get_measurement_text(num_targets, current_target_qty, targets):
 st.markdown(
     """
     <style>
-    /* 文字サイズのアンバランスを解消する強力なフォント統一（全要素に強制適用） */
-    html, body, [class*="st-"] {
+    /* 文字サイズのアンバランスを解消する超・強力なフォント統一（全要素に強制適用） */
+    * {
         font-family: "Meiryo", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif !important;
     }
     
@@ -68,7 +68,7 @@ st.markdown(
         font-weight: 400 !important;
     }
     
-    /* MFR専用のステータスヘッダー */
+    /* MFR専用のステータスヘッダー（※QRシステムではこのブロックはなくてもOKですが、あっても無害です） */
     .mfr-status-header {
         font-size: 1.25rem !important; 
         font-weight: bold !important; 
