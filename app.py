@@ -56,12 +56,19 @@ def get_measurement_text(num_targets, current_target_qty, targets):
 st.markdown(
     """
     <style>
+    /* MFR専用のステータスヘッダー */
     .mfr-status-header {
         font-size: 1.25rem !important; 
         font-weight: bold !important; 
         margin-top: 10px !important;
         margin-bottom: 5px !important;
     }
+    /* QRシステムと統一した共通UI設定 */
+    .stButton button { width: 100%; border-radius: 5px; }
+    .block-container { padding-top: 3.0rem !important; }
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.3rem !important; }
+    [data-testid="stSidebar"] button { padding: 0 !important; height: 32px !important; min-height: 32px !important; display: flex; align-items: center; justify-content: center; }
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;}
     </style>
     """,
     unsafe_allow_html=True
@@ -233,18 +240,20 @@ for b_start, b_end in on_blocks:
 # --- UI：ヘッダー ---
 try:
     logo_base64 = get_image_base64(logo_path)
-    # 【変更】align-items を flex-end にし、line-heightを調整して文字とアイコンの底辺をピタッと合わせる
-    # 【変更】「position: relative; top: 8px;」を追加して、文字だけを強制的に下に8ピクセル押し下げます
-    logo_html = f"""<div style="display: flex; align-items: flex-end; gap: 15px; margin-bottom: 10px;"><img src="data:image/png;base64,{logo_base64}" width="100px"><h1 style="margin: 0; color: #1f2937; line-height: 0.9; position: relative; top: 20px;">MFRスマート電源管理システム</h1></div>"""
+    logo_html = f"""
+    <div style="display: flex; align-items: flex-end; margin-bottom: 1rem;">
+        <img src="data:image/png;base64,{logo_base64}" height="100" style="margin-right: 15px; flex-shrink: 0;">
+        <span style="font-size: calc(1.4rem + 1.2vw); font-weight: 700; line-height: 1.0; color: #1f2937;">MFRスマート電源管理システム</span>
+    </div>
+    """
     st.markdown(logo_html, unsafe_allow_html=True)
 except:
     st.title("MFRスマート電源管理システム")
-
 st.write(f"現在時刻: **{now.strftime('%Y/%m/%d %H:%M:%S')}** (60秒ごとに自動更新中 🔄)")
 st.markdown("---")
 
 # --- MFR電源ステータス ---
-st.subheader("💡 MFR測定器 電源ステータス")
+st.header("💡 MFR測定器 電源ステータス")
 is_monday = (today_date.weekday() == 0)
 
 # 時刻判定用の定数を定義（日常点検表示用）
@@ -415,7 +424,7 @@ def get_shift_name(dt):
     elif 15 <= h < 23: return "B勤"
     else: return "C勤"
 
-st.subheader("🗓️ 各勤務の電源操作・作業フロー 一覧")
+st.header("🗓️ 各勤務の電源操作・作業フロー 一覧")
 if on_blocks:
     html = "<table style='width:100%; border-collapse: collapse; font-size: 20px; text-align: center; margin-bottom: 20px;'>"
     html += "<tr style='background-color: #f3f4f6; color: #111; font-weight: bold; border-bottom: 3px solid #ccc;'><th style='padding: 15px; border: 1px solid #ddd; width: 10%;'>状態</th><th style='padding: 15px; border: 1px solid #ddd; width: 30%;'>電源ON担当・ON時刻</th><th style='padding: 15px; border: 1px solid #ddd;'>作業フロー</th></tr>"
@@ -441,7 +450,7 @@ else:
     st.info("現在、予定されている電源操作はありません。")
 
 # --- UI：全体可視化グラフ ---
-st.subheader("📈 成型機稼働状況・MFR電源スケジュール")
+st.header("📈 成型機稼働状況・MFR電源スケジュール")
 
 timeline_data = []
 measurement_points = []
