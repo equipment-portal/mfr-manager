@@ -112,8 +112,8 @@ if 'initialized' not in st.session_state:
         st.session_state.jobs = {'100t': None, '450t': None, '550t': None}
         st.session_state.last_inspection_date = None
         st.session_state.products = {
-            'サンプル製品A': {'qty': 500, 'cycle': 60.0, 'measurements': 2},
-            'サンプル製品B': {'qty': 1000, 'cycle': 30.0, 'measurements': 3}
+            'サンプル製品A': {'machine': '100t', 'qty': 500, 'cycle': 60.0, 'measurements': 2},
+            'サンプル製品B': {'machine': '450t', 'qty': 1000, 'cycle': 30.0, 'measurements': 3}
         }
         st.session_state.shown_alerts = []
     st.session_state.initialized = True
@@ -127,13 +127,15 @@ with st.sidebar:
     with st.expander("製品の登録・編集・削除", expanded=False):
         with st.form("product_form"):
             p_name = st.text_input("製品名（新規登録または上書き）")
+            p_machine = st.selectbox("対象の成型機", ["100t", "450t", "550t"]) # ★これを追加
             p_qty = st.number_input("生産数", min_value=1, value=100)
             p_cycle = st.number_input("サイクルタイム(秒)", min_value=0.1, value=30.0, step=0.1)
             p_meas = st.radio("MFR測定回数", options=[2, 3], format_func=lambda x: "2回 (初め・終わり)" if x==2 else "3回 (初め・中・終わり)")
             submit_btn = st.form_submit_button("💾 登録・更新")
             if submit_btn and p_name:
-                st.session_state.products[p_name] = {'qty': p_qty, 'cycle': p_cycle, 'measurements': p_meas}
-                save_state(); st.success(f"「{p_name}」を登録しました。"); st.rerun()
+                # ★登録データに 'machine' を追加
+                st.session_state.products[p_name] = {'machine': p_machine, 'qty': p_qty, 'cycle': p_cycle, 'measurements': p_meas}
+                save_state(); st.success(f"「{p_name} ({p_machine})」を登録しました。"); st.rerun()
         
         st.markdown("---")
         if st.session_state.products:
@@ -323,10 +325,13 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
         est_current = 0
         
         if job is None:
-            if not st.session_state.products:
-                st.warning("⚠️ サイドバーから製品マスターを登録してください。")
+            # ★その成型機用に登録された製品だけを抽出（※機種設定がない古いデータは全成型機に表示してエラー回避）
+            machine_products = [p_name for p_name, p_info in st.session_state.products.items() if p_info.get('machine', machine) == machine]
+            
+            if not machine_products:
+                st.warning(f"⚠️ サイドバーから {machine} 用の製品マスターを登録してください。")
             else:
-                product_name = st.selectbox("製品名を選択", list(st.session_state.products.keys()), key=f"prod_sel_{machine}")
+                product_name = st.selectbox("製品名を選択", machine_products, key=f"prod_sel_{machine}")
                 prod_info = st.session_state.products[product_name]
                 total_qty, cycle_time, meas_count = prod_info['qty'], prod_info['cycle'], prod_info['measurements']
                 
