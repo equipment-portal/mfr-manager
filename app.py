@@ -125,23 +125,57 @@ with st.sidebar:
         
     st.subheader("📦 製品マスター管理")
     with st.expander("製品の登録・編集・削除", expanded=False):
+        # 1. 編集対象の選択（新規か既存か）
+        product_options = ["✨ 新規登録 (空紙から作成)"] + list(st.session_state.products.keys())
+        selected_prod = st.selectbox("📝 編集する製品を選択 (または新規登録)", product_options)
+
+        # 2. 選択された製品のデータを読み込む
+        if selected_prod == "✨ 新規登録 (空紙から作成)":
+            def_name = ""
+            def_machine_idx = 0
+            def_qty = 100
+            def_cycle = 30.0
+            def_meas_idx = 0
+        else:
+            def_name = selected_prod
+            p_info = st.session_state.products[selected_prod]
+            
+            # エラー防止：古いデータに machine がない場合は 100t にする
+            m_val = p_info.get('machine', '100t')
+            def_machine_idx = ["100t", "450t", "550t"].index(m_val) if m_val in ["100t", "450t", "550t"] else 0
+            
+            def_qty = p_info.get('qty', 100)
+            def_cycle = float(p_info.get('cycle', 30.0))
+            def_meas_idx = 0 if p_info.get('measurements', 2) == 2 else 1
+
+        # 3. 入力フォーム（初期値に呼び出したデータをセット）
         with st.form("product_form"):
-            p_name = st.text_input("製品名（新規登録または上書き）")
-            p_machine = st.selectbox("対象の成型機", ["100t", "450t", "550t"]) # ★これを追加
-            p_qty = st.number_input("生産数", min_value=1, value=100)
-            p_cycle = st.number_input("サイクルタイム(秒)", min_value=0.1, value=30.0, step=0.1)
-            p_meas = st.radio("MFR測定回数", options=[2, 3], format_func=lambda x: "2回 (初め・終わり)" if x==2 else "3回 (初め・中・終わり)")
+            p_name = st.text_input("製品名", value=def_name)
+            p_machine = st.selectbox("対象の成型機", ["100t", "450t", "550t"], index=def_machine_idx)
+            p_qty = st.number_input("生産数", min_value=1, value=def_qty)
+            p_cycle = st.number_input("サイクルタイム(秒)", min_value=0.1, value=def_cycle, step=0.1)
+            p_meas = st.radio("MFR測定回数", options=[2, 3], index=def_meas_idx, format_func=lambda x: "2回 (初め・終わり)" if x==2 else "3回 (初め・中・終わり)")
+            
             submit_btn = st.form_submit_button("💾 登録・更新")
             if submit_btn and p_name:
-                # ★登録データに 'machine' を追加
+                # 既存製品の名前を変更（リネーム）した場合は、古い名前のデータを消して重複を防ぐ
+                if selected_prod != "✨ 新規登録 (空紙から作成)" and p_name != selected_prod:
+                    del st.session_state.products[selected_prod]
+                    
                 st.session_state.products[p_name] = {'machine': p_machine, 'qty': p_qty, 'cycle': p_cycle, 'measurements': p_meas}
-                save_state(); st.success(f"「{p_name} ({p_machine})」を登録しました。"); st.rerun()
+                save_state()
+                st.success(f"「{p_name} ({p_machine})」を登録・更新しました。")
+                st.rerun()
         
+        # 4. 削除ツール
         st.markdown("---")
         if st.session_state.products:
-            del_name = st.selectbox("削除する製品を選択", list(st.session_state.products.keys()))
+            del_name = st.selectbox("削除する製品を選択", list(st.session_state.products.keys()), key="del_prod_sel")
             if st.button("🗑️ 選択した製品を削除"):
-                del st.session_state.products[del_name]; save_state(); st.success(f"「{del_name}」を削除しました。"); st.rerun()
+                del st.session_state.products[del_name]
+                save_state()
+                st.success(f"「{del_name}」を削除しました。")
+                st.rerun()
 
     st.markdown("---")
     st.subheader("🔧 リセット・テスト用ツール")
