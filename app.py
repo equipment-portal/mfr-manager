@@ -52,18 +52,18 @@ def get_measurement_text(num_targets, current_target_qty, targets):
         if current_target_qty == targets[2]: return '終'
     return str(current_target_qty)
 
-# --- CSS設定（QRシステムと完全統一！） ---
+# --- CSS設定 ---
 st.markdown(
     """
     <style>
-    /* 英数字と漢字のサイズ感を統一する（強力すぎる上書きをやめ、大枠にだけ適用して自然に浸透させる） */
-    html, body, .stApp {
+    /* 文字サイズのアンバランスを解消する強力なフォント統一（全要素に強制適用） */
+    html, body, [class*="st-"] {
         font-family: "Meiryo", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif !important;
     }
     
-    /* サイドバーの矢印などを絶対に文字化けさせない保護呪文 */
-    .material-symbols-rounded, [data-testid="collapsedControl"] *, [data-testid*="Icon"] {
-        font-family: "Material Symbols Rounded", "Material Icons" !important;
+    /* サイドバーの矢印（keyboard...）などを絶対に文字化けさせない最強のシールド */
+    .material-symbols-rounded, .material-icons, [data-testid="collapsedControl"] *, [data-testid*="Icon"], svg, i {
+        font-family: "Material Symbols Rounded", "Material Icons", sans-serif !important;
         font-style: normal !important;
         font-weight: 400 !important;
     }
