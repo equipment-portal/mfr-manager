@@ -9,6 +9,7 @@ import base64
 import json
 import urllib.request
 from streamlit_autorefresh import st_autorefresh
+import streamlit.components.v1 as components  # ★この1行を追加
 
 # --- GitHub保存・読み込みロジック ---
 # QRシステムと同じリポジトリに「mfr_products.json」という名前でマスターを保存します
@@ -103,6 +104,27 @@ def play_alert_sound(sound_file_path):
             st.markdown(audio_html, unsafe_allow_html=True)
         except Exception as e:
             pass
+# ★ここまで挿入
+
+# ★ここから挿入：Windowsのデスクトップ通知（最前面）を呼び出す魔法
+def show_desktop_notify(title, body):
+    js_code = f"""
+    <script>
+    // Streamlitの枠（iframe）を越えて、大元のブラウザに通知を要求する
+    if (window.parent && "Notification" in window.parent) {{
+        if (window.parent.Notification.permission === "granted") {{
+            new window.parent.Notification("{title}", {{body: "{body}"}});
+        }} else if (window.parent.Notification.permission !== "denied") {{
+            window.parent.Notification.requestPermission().then(function (permission) {{
+                if (permission === "granted") {{
+                    new window.parent.Notification("{title}", {{body: "{body}"}});
+                }}
+            }});
+        }}
+    }}
+    </script>
+    """
+    components.html(js_code, height=0, width=0)
 # ★ここまで挿入
 
 def get_measurement_text(num_targets, current_target_qty, targets):
@@ -350,6 +372,7 @@ for pt in valid_upcoming:
         if alert_id_meas not in st.session_state.shown_alerts:
             st.session_state.shown_alerts.append(alert_id_meas); save_state()
             st.toast(msg_meas, icon="🚨")
+            show_desktop_notify("🎯 MFR測定アラート", msg_meas)  # ★この1行を追加
             play_alert_sound("alert.mp3")  # ★ここを挿入（用意した音声ファイル名を指定）
 
 # 3. 電源ON・OFFアラーム
@@ -361,13 +384,19 @@ for b_start, b_end in on_blocks:
             target_tasks = [x['machine'] for x in valid_upcoming if b_start <= x['est_time'] <= b_end]
             target_machine = target_tasks[0] if target_tasks else "成型機"
             scheduled_time_str = (b_start + timedelta(minutes=60)).strftime('%H:%M')
-            st.toast(f"🔥 MFR測定器 電源ON！（{target_machine} {scheduled_time_str} 予定）", icon="🔥")
+            
+            msg_on = f"🔥 MFR測定器 電源ON！（{target_machine} {scheduled_time_str} 予定）"
+            st.toast(msg_on, icon="🔥")
+            show_desktop_notify("🔥 電源操作アラート", msg_on) # ★この1行を追加
 
     if b_end + timedelta(minutes=3) <= now < b_end + timedelta(minutes=18):
         alert_id_off = f"OFF_{b_end.strftime('%Y%m%d_%H%M')}"
         if alert_id_off not in st.session_state.shown_alerts:
             st.session_state.shown_alerts.append(alert_id_off); save_state()
-            st.toast("💤 MFR測定器 電源OFF！（測定完了・冷却開始）", icon="💤")
+            
+            msg_off = "💤 MFR測定器 電源OFF！（測定完了・冷却開始）"
+            st.toast(msg_off, icon="💤")
+            show_desktop_notify("💤 電源操作アラート", msg_off) # ★この1行を追加
 
 # --- UI：ヘッダー（QRシステムと同じサイズ感に統一） ---
 try:
