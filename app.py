@@ -87,6 +87,24 @@ def get_image_base64(path):
     with open(path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode()
 
+# ★ここから挿入：クラウド上でブラウザから音を鳴らす魔法の関数
+def play_alert_sound(sound_file_path):
+    if os.path.exists(sound_file_path):
+        try:
+            with open(sound_file_path, "rb") as f:
+                audio_bytes = f.read()
+            audio_base64 = base64.b64encode(audio_bytes).decode()
+            # 見えないオーディオプレイヤーを配置して自動再生させる
+            audio_html = f"""
+                <audio autoplay="true" style="display:none;">
+                    <source src="data:audio/mp3;base64,{audio_base64}" type="audio/mp3">
+                </audio>
+            """
+            st.markdown(audio_html, unsafe_allow_html=True)
+        except Exception as e:
+            pass
+# ★ここまで挿入
+
 def get_measurement_text(num_targets, current_target_qty, targets):
     if num_targets == 2:
         if current_target_qty == targets[0]: return '始'
@@ -332,6 +350,7 @@ for pt in valid_upcoming:
         if alert_id_meas not in st.session_state.shown_alerts:
             st.session_state.shown_alerts.append(alert_id_meas); save_state()
             st.toast(msg_meas, icon="🚨")
+            play_alert_sound("alert.mp3")  # ★ここを挿入（用意した音声ファイル名を指定）
 
 # 3. 電源ON・OFFアラーム
 for b_start, b_end in on_blocks:
