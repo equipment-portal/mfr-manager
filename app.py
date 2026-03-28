@@ -6,7 +6,52 @@ from datetime import datetime, timedelta, time as dt_time
 import pickle
 import os
 import base64
+import json
+import urllib.request
 from streamlit_autorefresh import st_autorefresh
+
+# --- GitHub保存・読み込みロジック ---
+# QRシステムと同じリポジトリに「mfr_products.json」という名前でマスターを保存します
+GITHUB_REPO = "equipment-portal/qr-manager"
+GITHUB_TOKEN = st.secrets.get("github_token", "")
+
+def load_products_from_github():
+    if not GITHUB_TOKEN: return None
+    try:
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/mfr_products.json"
+        req = urllib.request.Request(api_url)
+        req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        with urllib.request.urlopen(req) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            return json.loads(content)
+    except Exception:
+        return None
+
+def save_products_to_github(products_dict):
+    if not GITHUB_TOKEN: return
+    try:
+        file_name = "mfr_products.json"
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_name}"
+        
+        sha = None
+        try:
+            req_check = urllib.request.Request(api_url)
+            req_check.add_header("Authorization", f"token {GITHUB_TOKEN}")
+            with urllib.request.urlopen(req_check) as res:
+                sha = json.loads(res.read().decode("utf-8"))["sha"]
+        except: pass
+        
+        encoded = base64.b64encode(json.dumps(products_dict, ensure_ascii=False, indent=2).encode("utf-8")).decode("utf-8")
+        payload = {"message": "Update MFR Products Master", "content": encoded, "branch": "main"}
+        if sha: payload["sha"] = sha
+        
+        req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), method="PUT")
+        req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        req.add_header("Content-Type", "application/json")
+        urllib.request.urlopen(req)
+    except Exception as e:
+        print("GitHubセーブエラー:", e)
 
 # ページ設定
 logo_path = "logo.png" 
@@ -103,19 +148,24 @@ st.markdown(
 # --- 初期設定・状態管理 ---
 if 'initialized' not in st.session_state:
     saved_state = load_state()
+    gh_products = load_products_from_github() # ★起動時にGitHubからマスターを取得！
+
     if saved_state:
         st.session_state.jobs = saved_state['jobs']
         st.session_state.last_inspection_date = saved_state['last_inspection_date']
-        st.session_state.products = saved_state.get('products', {})
         st.session_state.shown_alerts = saved_state.get('shown_alerts', [])
+        # ★GitHubのデータがあれば最優先、なければローカルデータ
+        st.session_state.products = gh_products if gh_products is not None else saved_state.get('products', {})
     else:
         st.session_state.jobs = {'100t': None, '450t': None, '550t': None}
         st.session_state.last_inspection_date = None
-        st.session_state.products = {
+        st.session_state.shown_alerts = []
+        default_products = {
             'サンプル製品A': {'machine': '100t', 'qty': 500, 'cycle': 60.0, 'measurements': 2},
             'サンプル製品B': {'machine': '450t', 'qty': 1000, 'cycle': 30.0, 'measurements': 3}
         }
-        st.session_state.shown_alerts = []
+        st.session_state.products = gh_products if gh_products is not None else default_products
+        
     st.session_state.initialized = True
     st.session_state.inspection_dialog_shown = False 
 
@@ -156,7 +206,7 @@ with st.sidebar:
             p_cycle = st.number_input("サイクルタイム(秒)", min_value=0.1, value=def_cycle, step=0.1)
             p_meas = st.radio("MFR測定回数", options=[2, 3], index=def_meas_idx, format_func=lambda x: "2回 (初め・終わり)" if x==2 else "3回 (初め・中・終わり)")
             
-            submit_btn = st.form_submit_button("💾 登録・更新")
+            submit_btn = st.form_submit_button("💾 登録・更新（クラウド同期）")
             if submit_btn and p_name:
                 # 既存製品の名前を変更（リネーム）した場合は、古い名前のデータを消して重複を防ぐ
                 if selected_prod != "✨ 新規登録 (空紙から作成)" and p_name != selected_prod:
@@ -164,17 +214,21 @@ with st.sidebar:
                     
                 st.session_state.products[p_name] = {'machine': p_machine, 'qty': p_qty, 'cycle': p_cycle, 'measurements': p_meas}
                 save_state()
-                st.success(f"「{p_name} ({p_machine})」を登録・更新しました。")
+                save_products_to_github(st.session_state.products) # ★GitHubに自動バックアップ！
+                
+                st.success(f"「{p_name} ({p_machine})」をクラウドに登録・更新しました！")
                 st.rerun()
         
         # 4. 削除ツール
         st.markdown("---")
         if st.session_state.products:
             del_name = st.selectbox("削除する製品を選択", list(st.session_state.products.keys()), key="del_prod_sel")
-            if st.button("🗑️ 選択した製品を削除"):
+            if st.button("🗑️ 選択した製品を削除（クラウド同期）"):
                 del st.session_state.products[del_name]
                 save_state()
-                st.success(f"「{del_name}」を削除しました。")
+                save_products_to_github(st.session_state.products) # ★削除もGitHubに同期！
+                
+                st.success(f"「{del_name}」をクラウドから削除しました。")
                 st.rerun()
 
     st.markdown("---")
