@@ -216,11 +216,11 @@ with st.sidebar:
     st.subheader("📦 製品マスター管理")
     with st.expander("製品の登録・編集・削除", expanded=False):
         # 1. 編集対象の選択（新規か既存か）
-        product_options = ["✨ 新規登録 (空紙から作成)"] + list(st.session_state.products.keys())
+        product_options = ["✨ 新規登録"] + list(st.session_state.products.keys())
         selected_prod = st.selectbox("📝 編集する製品を選択 (または新規登録)", product_options)
 
         # 2. 選択された製品のデータを読み込む
-        if selected_prod == "✨ 新規登録 (空紙から作成)":
+        if selected_prod == "✨ 新規登録":
             def_name = ""
             def_machine_idx = 0
             def_qty = 100
@@ -249,7 +249,7 @@ with st.sidebar:
             submit_btn = st.form_submit_button("💾 登録・更新（クラウド同期）")
             if submit_btn and p_name:
                 # 既存製品の名前を変更（リネーム）した場合は、古い名前のデータを消して重複を防ぐ
-                if selected_prod != "✨ 新規登録 (空紙から作成)" and p_name != selected_prod:
+                if selected_prod != "✨ 新規登録" and p_name != selected_prod:
                     del st.session_state.products[selected_prod]
                     
                 st.session_state.products[p_name] = {'machine': p_machine, 'qty': p_qty, 'cycle': p_cycle, 'measurements': p_meas}
