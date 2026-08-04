@@ -98,43 +98,70 @@ def get_image_base64(path):
         return base64.b64encode(image_file.read()).decode()
 
 # --- Chrome通知・警告音 ---
-# alert.mp3 が同じフォルダーにあれば使用し、なければ内蔵の警告音を自動生成します。
-ALERT_SOUND_FILE = "alert.mp3"
+# 一般的な「高音→低音→高音」の警告音です。
+# 同じフォルダーに alert_general.wav があればそれを優先し、
+# ない場合も同じ音色をプログラム内で自動生成します。
+ALERT_SOUND_FILE = "alert_general.wav"
 
-@st.cache_data(show_spinner=False)
-def get_alert_sound_data_url():
-    if os.path.exists(ALERT_SOUND_FILE):
-        mime_type = mimetypes.guess_type(ALERT_SOUND_FILE)[0] or "audio/mpeg"
-        with open(ALERT_SOUND_FILE, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("ascii")
-        return f"data:{mime_type};base64,{encoded}"
 
-    sample_rate = 22_050
+def _build_general_alarm_wav() -> bytes:
+    """クリック音を抑えた、一般的な繰り返しアラーム音をWAVで生成する。"""
+    sample_rate = 44_100
+    amplitude = 22_000
+    attack_release_seconds = 0.012
+
+    # 高音→低音→高音の3回警告＋少し長めの無音。
+    pattern = [
+        (960, 0.22), (0, 0.08),
+        (760, 0.22), (0, 0.08),
+        (960, 0.22), (0, 0.48),
+    ]
+
+    frames = bytearray()
+    fade_frames = max(1, int(sample_rate * attack_release_seconds))
+
+    for frequency, duration in pattern:
+        frame_count = int(sample_rate * duration)
+        for i in range(frame_count):
+            if frequency == 0:
+                sample = 0
+            else:
+                # 基音＋弱い2次高調波で、単純な電子音よりアラームらしい音色にする。
+                phase = 2 * math.pi * frequency * i / sample_rate
+                raw = math.sin(phase) + 0.28 * math.sin(2 * phase)
+
+                # 音の開始・終了を滑らかにして「プチッ」というノイズを防ぐ。
+                envelope = 1.0
+                if i < fade_frames:
+                    envelope = i / fade_frames
+                elif i >= frame_count - fade_frames:
+                    envelope = max(0.0, (frame_count - i - 1) / fade_frames)
+
+                sample = int(amplitude * 0.78 * raw * envelope)
+                sample = max(-32_768, min(32_767, sample))
+
+            frames.extend(struct.pack("<h", sample))
+
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
         wav_file.setframerate(sample_rate)
+        wav_file.writeframes(bytes(frames))
 
-        samples = []
-        pattern = [
-            (880, 0.28), (0, 0.12),
-            (880, 0.28), (0, 0.12),
-            (1_100, 0.38), (0, 0.25),
-        ]
-        for frequency, duration in pattern:
-            frame_count = int(sample_rate * duration)
-            for i in range(frame_count):
-                value = 0 if frequency == 0 else int(
-                    18_000 * math.sin(2 * math.pi * frequency * i / sample_rate)
-                )
-                samples.append(struct.pack("<h", value))
+    return buffer.getvalue()
 
-        wav_file.writeframes(b"".join(samples))
 
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+@st.cache_data(show_spinner=False)
+def get_alert_sound_data_url():
+    if os.path.exists(ALERT_SOUND_FILE):
+        mime_type = mimetypes.guess_type(ALERT_SOUND_FILE)[0] or "audio/wav"
+        with open(ALERT_SOUND_FILE, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    encoded = base64.b64encode(_build_general_alarm_wav()).decode("ascii")
     return f"data:audio/wav;base64,{encoded}"
-
 
 def render_monitor_activation():
     """始業時に直接クリックして、Chromeの音声再生と通知権限を有効にする。"""
@@ -1068,66 +1095,143 @@ st.write("日々のこまめな電源OFF運用によって節約できた「電�
 
 with st.expander("📊 現在のスケジュールにおける削減効果金額を計算", expanded=True):
     col_k, col_e, col_h, col_l = st.columns(4)
-    with col_k: power_kw = st.number_input("MFR消費電力 (kW)", value=0.80, step=0.10, format="%.2f", help="最大値 0.80 kW")
-    with col_e: elec_price = st.number_input("電気代単価 (円/kWh)", value=20.00, step=1.00, format="%.2f", help="20～25円目安")
-    with col_h: heater_cost = st.number_input("修繕・メンテナンス費用 (円)", value=150000, step=10000, help="部品交換や修理にかかる1回あたりの概算費用")
-    with col_l: heater_life_hours = st.number_input("メンテナンス周期 (時間)", value=10000, step=1000, help="上記の修繕が必要になるまでの想定稼働時間（過去の記録から設定）")
+    with col_k:
+        power_kw = st.number_input(
+            "MFR消費電力 (kW)", min_value=0.0, value=0.80, step=0.10,
+            format="%.2f", help="最大値 0.80 kW"
+        )
+    with col_e:
+        elec_price = st.number_input(
+            "電気代単価 (円/kWh)", min_value=0.0, value=20.00, step=1.00,
+            format="%.2f", help="20～25円目安"
+        )
+    with col_h:
+        heater_cost = st.number_input(
+            "修繕・メンテナンス費用 (円)", min_value=0, value=150000, step=10000,
+            help="設備費を計算しない場合は0にしてください。"
+        )
+    with col_l:
+        heater_life_hours = st.number_input(
+            "メンテナンス周期 (時間)", min_value=0, value=10000, step=1000,
+            help="設備費を計算しない場合は0にしてください。"
+        )
+
+    # 費用または周期のどちらかが0なら、設備寿命・修繕費の計算を完全に除外する。
+    maintenance_enabled = heater_cost > 0 and heater_life_hours > 0
+    if not maintenance_enabled:
+        st.info("ℹ️ 修繕・メンテナンス費用または周期が0のため、設備寿命・修繕費は計算対象外です。電気代のみ計算します。")
 
     if timeline_data and on_blocks:
-        schedule_start = min([d['Start'] for d in timeline_data])
-        schedule_end = max([d['End'] for d in timeline_data])
-        total_hours = (schedule_end - schedule_start).total_seconds() / 3600
-        new_on_hours = sum([(b_end - b_start).total_seconds() for b_start, b_end in on_blocks]) / 3600
-        saved_hours = total_hours - new_on_hours
-        
+        schedule_start = min(d['Start'] for d in timeline_data)
+        schedule_end = max(d['End'] for d in timeline_data)
+        total_hours = max(0.0, (schedule_end - schedule_start).total_seconds() / 3600)
+        new_on_hours = max(
+            0.0,
+            sum((b_end - b_start).total_seconds() for b_start, b_end in on_blocks) / 3600
+        )
+        saved_hours = max(0.0, total_hours - new_on_hours)
+
         if saved_hours > 0:
             saved_cost = saved_hours * power_kw * elec_price
-            saved_heater_value = saved_hours * (heater_cost / heater_life_hours)
+
+            if maintenance_enabled:
+                maintenance_cost_per_hour = heater_cost / heater_life_hours
+                saved_heater_value = saved_hours * maintenance_cost_per_hour
+                old_maint = total_hours * maintenance_cost_per_hour
+                new_maint = new_on_hours * maintenance_cost_per_hour
+            else:
+                maintenance_cost_per_hour = 0.0
+                saved_heater_value = 0.0
+                old_maint = 0.0
+                new_maint = 0.0
 
             st.success(f"✨ **現在のスケジュール期間中（約 {total_hours:.1f} 時間）の改善効果**")
             res_col1, res_col2, res_col3 = st.columns(3)
-            
+
             help_time = "【計算式】\n従来OFFにしていなかった全期間の時間 － 今回のスケジュールでONになっている時間"
             help_elec = "【計算式】\n削減できた待機時間 × MFR消費電力(kW) × 電気代単価"
-            help_maint = "【計算式】\n削減できた待機時間 × (修繕・メンテナンス費用 ÷ メンテナンス周期)\n\n※稼働時間が減ることで、将来発生するメンテナンス費用をどれだけ先送り（節約）できたかを金額換算しています。"
-            
-            res_col1.metric("無駄な待機時間の削減", f"{saved_hours:.1f} 時間", f"従来: {total_hours:.1f}h → 今回: {new_on_hours:.1f}h", delta_color="inverse", help=help_time)
-            res_col2.metric("電気代の削減", f"{int(saved_cost):,} 円", f"▲ {int(saved_cost)}円", delta_color="inverse", help=help_elec)
-            res_col3.metric("設備寿命(修繕費)の節約換算", f"{int(saved_heater_value):,} 円", "部品の長寿命化による効果", help=help_maint)
-            st.caption("※この計算は現在画面に表示されているジョブ（未来の予測を含む）を対象とした概算シミュレーションです。")
+            help_maint = (
+                "【計算式】\n削減できた待機時間 × "
+                "(修繕・メンテナンス費用 ÷ メンテナンス周期)\n\n"
+                "※費用または周期を0にすると、この計算を除外します。"
+            )
 
-            # --- 可視化グラフの追加と調整 ---
+            res_col1.metric(
+                "無駄な待機時間の削減", f"{saved_hours:.1f} 時間",
+                f"従来: {total_hours:.1f}h → 今回: {new_on_hours:.1f}h",
+                delta_color="inverse", help=help_time
+            )
+            res_col2.metric(
+                "電気代の削減", f"{int(saved_cost):,} 円",
+                f"▲ {int(saved_cost):,}円", delta_color="inverse", help=help_elec
+            )
+
+            if maintenance_enabled:
+                res_col3.metric(
+                    "設備寿命(修繕費)の節約換算",
+                    f"{int(saved_heater_value):,} 円",
+                    "部品の長寿命化による効果",
+                    help=help_maint
+                )
+            else:
+                res_col3.metric(
+                    "設備寿命(修繕費)",
+                    "計算対象外",
+                    "0設定のため除外",
+                    help=help_maint
+                )
+
+            if maintenance_enabled:
+                st.caption("※電気代と設備寿命（修繕費）の概算を、現在のスケジュールを基に計算しています。")
+            else:
+                st.caption("※設備費は0設定のため除外し、電気代のみを現在のスケジュールから概算しています。")
+
+            # --- 可視化グラフ ---
             st.markdown("<br>", unsafe_allow_html=True)
-            
+
             old_elec = total_hours * power_kw * elec_price
-            old_maint = total_hours * (heater_cost / heater_life_hours)
             new_elec = new_on_hours * power_kw * elec_price
-            new_maint = new_on_hours * (heater_cost / heater_life_hours)
             total_old = old_elec + old_maint
             total_new = new_elec + new_maint
-            saved_total = total_old - total_new
+            saved_total = max(0.0, total_old - total_new)
 
-            df_eco = pd.DataFrame([
+            eco_rows = [
                 {"運用方法": "❌ 従来の運用 (ずっとON)", "コスト内訳": "電気代", "金額": old_elec},
-                {"運用方法": "❌ 従来の運用 (ずっとON)", "コスト内訳": "修繕費 (寿命換算)", "金額": old_maint},
                 {"運用方法": "✨ EcoNavi スマート運用", "コスト内訳": "電気代", "金額": new_elec},
-                {"運用方法": "✨ EcoNavi スマート運用", "コスト内訳": "修繕費 (寿命換算)", "金額": new_maint}
-            ])
+            ]
+            if maintenance_enabled:
+                eco_rows.extend([
+                    {"運用方法": "❌ 従来の運用 (ずっとON)", "コスト内訳": "修繕費 (寿命換算)", "金額": old_maint},
+                    {"運用方法": "✨ EcoNavi スマート運用", "コスト内訳": "修繕費 (寿命換算)", "金額": new_maint},
+                ])
+
+            df_eco = pd.DataFrame(eco_rows)
+            chart_title = (
+                "<b>📊 スマート運用によるコスト削減効果</b>"
+                if maintenance_enabled
+                else "<b>📊 スマート運用による電気代削減効果</b>"
+            )
 
             fig_eco = px.bar(
                 df_eco, x="運用方法", y="金額", color="コスト内訳",
                 text="金額",
-                color_discrete_map={"電気代": "#f4a261", "修繕費 (寿命換算)": "#e76f51"} 
+                color_discrete_map={"電気代": "#f4a261", "修繕費 (寿命換算)": "#e76f51"}
             )
-            fig_eco.update_traces(texttemplate='<b>%{text:,.0f} 円</b>', textposition='inside', insidetextfont=dict(size=18, color="white"))
-            
+            fig_eco.update_traces(
+                texttemplate='<b>%{text:,.0f} 円</b>',
+                textposition='inside',
+                insidetextfont=dict(size=18, color="white")
+            )
+
+            # 全費用が0でもPlotlyの軸計算や角度計算で0除算しないよう、最低1円幅を確保する。
+            y_axis_max = max(total_old * 1.5, 1.0)
             fig_eco.update_layout(
                 barmode='stack',
-                height=550, 
-                title=dict(text="<b>📊 スマート運用によるコスト削減効果</b>", font=dict(size=22)), 
+                height=550,
+                title=dict(text=chart_title, font=dict(size=22)),
                 xaxis_title="",
                 yaxis_title="発生コスト（円）",
-                yaxis=dict(range=[0, total_old * 1.5], tickfont=dict(size=14, weight="bold")),
+                yaxis=dict(range=[0, y_axis_max], tickfont=dict(size=14, weight="bold")),
                 xaxis=dict(tickfont=dict(size=18, weight="bold")),
                 legend=dict(
                     title="<b>コスト内訳</b>",
@@ -1139,26 +1243,38 @@ with st.expander("📊 現在のスケジュールにおける削減効果金額
                 margin=dict(t=80, b=50, l=50, r=50),
                 plot_bgcolor="rgba(0,0,0,0)",
                 paper_bgcolor="rgba(250, 250, 250, 1)",
-                yaxis_showgrid=True, yaxis_gridcolor="rgba(200,200,200,0.5)"
+                yaxis_showgrid=True,
+                yaxis_gridcolor="rgba(200,200,200,0.5)"
             )
 
-            fig_eco.add_annotation(x="❌ 従来の運用 (ずっとON)", y=total_old, yshift=15, yanchor="bottom", text=f"<b>計 {int(total_old):,} 円</b>", showarrow=False, font=dict(size=22))
-            fig_eco.add_annotation(x="✨ EcoNavi スマート運用", y=total_new, yshift=15, yanchor="bottom", text=f"<b>計 {int(total_new):,} 円</b>", showarrow=False, font=dict(size=22, color="#00a82d"))
+            fig_eco.add_annotation(
+                x="❌ 従来の運用 (ずっとON)", y=total_old,
+                yshift=15, yanchor="bottom",
+                text=f"<b>計 {int(total_old):,} 円</b>",
+                showarrow=False, font=dict(size=22)
+            )
+            fig_eco.add_annotation(
+                x="✨ EcoNavi スマート運用", y=total_new,
+                yshift=15, yanchor="bottom",
+                text=f"<b>計 {int(total_new):,} 円</b>",
+                showarrow=False, font=dict(size=22, color="#00a82d")
+            )
 
-            approx_dx_px = 500  
-            approx_dy_px = ((total_old - total_new) / (total_old * 1.5)) * 400 
-            
+            approx_dx_px = 500
+            approx_dy_px = ((total_old - total_new) / y_axis_max) * 400
             angle_deg = int(math.degrees(math.atan2(approx_dy_px, approx_dx_px)))
 
             fig_eco.add_annotation(
-                x=0.5, y=(total_old + total_new) / 2, xref="paper", yref="y",
+                x=0.5, y=(total_old + total_new) / 2,
+                xref="paper", yref="y",
                 text="<span style='font-size: 80px; color: #e63946; text-shadow: 2px 2px 3px rgba(0,0,0,0.2);'>➡</span>",
                 showarrow=False,
-                textangle=angle_deg 
+                textangle=angle_deg
             )
-            
+
             fig_eco.add_annotation(
-                x=0.5, y=total_old * 1.15, xref="paper", yref="y", yanchor="bottom", 
+                x=0.5, y=max(total_old * 1.15, y_axis_max * 0.75),
+                xref="paper", yref="y", yanchor="bottom",
                 text=f"<b>✨ 削減効果</b><br><br><b><span style='font-size:42px; color:#d00000;'>▲ {int(saved_total):,} 円</span></b>",
                 showarrow=False,
                 font=dict(size=22, color="#111"),
