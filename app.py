@@ -8,6 +8,11 @@ import os
 import base64
 import json
 import urllib.request
+import io
+import math
+import mimetypes
+import struct
+import wave
 from streamlit_autorefresh import st_autorefresh
 import streamlit.components.v1 as components  # ★この1行を追加
 
@@ -59,8 +64,9 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-# 60秒ごとに自動更新
-st_autorefresh(interval=60000, key="data_refresh")
+# 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
+AUTO_REFRESH_MS = 10_000
+st_autorefresh(interval=AUTO_REFRESH_MS, key="data_refresh")
 
 # --- データの保存と読み込み ---
 STATE_FILE = "mfr_state.pkl"
@@ -79,7 +85,10 @@ def save_state():
         'jobs': st.session_state.jobs,
         'last_inspection_date': st.session_state.last_inspection_date,
         'products': st.session_state.products,
-        'shown_alerts': st.session_state.shown_alerts
+        # 作業者が［確認しました］を押した通知だけを保存
+        'acknowledged_alerts': st.session_state.acknowledged_alerts,
+        # 実際に測定・点検が完了した10分後の電源OFF通知
+        'pending_power_off_due': st.session_state.pending_power_off_due
     }
     with open(STATE_FILE, "wb") as f:
         pickle.dump(state_to_save, f)
@@ -88,44 +97,187 @@ def get_image_base64(path):
     with open(path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode()
 
-# ★ここから挿入：クラウド上でブラウザから音を鳴らす魔法の関数
-def play_alert_sound(sound_file_path):
-    if os.path.exists(sound_file_path):
-        try:
-            with open(sound_file_path, "rb") as f:
-                audio_bytes = f.read()
-            audio_base64 = base64.b64encode(audio_bytes).decode()
-            # 見えないオーディオプレイヤーを配置して自動再生させる
-            audio_html = f"""
-                <audio autoplay="true" style="display:none;">
-                    <source src="data:audio/mp3;base64,{audio_base64}" type="audio/mp3">
-                </audio>
-            """
-            st.markdown(audio_html, unsafe_allow_html=True)
-        except Exception as e:
-            pass
-# ★ここまで挿入
+# --- Chrome通知・警告音 ---
+# alert.mp3 が同じフォルダーにあれば使用し、なければ内蔵の警告音を自動生成します。
+ALERT_SOUND_FILE = "alert.mp3"
 
-# ★ここから挿入：Windowsのデスクトップ通知（最前面）を呼び出す魔法
-def show_desktop_notify(title, body):
-    js_code = f"""
+@st.cache_data(show_spinner=False)
+def get_alert_sound_data_url():
+    if os.path.exists(ALERT_SOUND_FILE):
+        mime_type = mimetypes.guess_type(ALERT_SOUND_FILE)[0] or "audio/mpeg"
+        with open(ALERT_SOUND_FILE, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    sample_rate = 22_050
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+
+        samples = []
+        pattern = [
+            (880, 0.28), (0, 0.12),
+            (880, 0.28), (0, 0.12),
+            (1_100, 0.38), (0, 0.25),
+        ]
+        for frequency, duration in pattern:
+            frame_count = int(sample_rate * duration)
+            for i in range(frame_count):
+                value = 0 if frequency == 0 else int(
+                    18_000 * math.sin(2 * math.pi * frequency * i / sample_rate)
+                )
+                samples.append(struct.pack("<h", value))
+
+        wav_file.writeframes(b"".join(samples))
+
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:audio/wav;base64,{encoded}"
+
+
+def render_monitor_activation():
+    """始業時に直接クリックして、Chromeの音声再生と通知権限を有効にする。"""
+    sound_url = json.dumps(get_alert_sound_data_url())
+    html = f"""
+    <div style="font-family:Meiryo,sans-serif;border:2px solid #2563eb;border-radius:10px;
+                padding:12px;background:#eff6ff;">
+      <button id="mfr-enable" style="width:100%;padding:12px;font-size:17px;font-weight:bold;
+              color:white;background:#1d4ed8;border:0;border-radius:8px;cursor:pointer;">
+        🔔 監視開始・通知を許可・警告音をテスト
+      </button>
+      <div id="mfr-status" style="margin-top:8px;font-size:14px;font-weight:bold;color:#1f2937;">
+        シフト開始時に上のボタンを1回押してください。
+      </div>
+    </div>
     <script>
-    // Streamlitの枠（iframe）を越えて、大元のブラウザに通知を要求する
-    if (window.parent && "Notification" in window.parent) {{
-        if (window.parent.Notification.permission === "granted") {{
-            new window.parent.Notification("{title}", {{body: "{body}"}});
-        }} else if (window.parent.Notification.permission !== "denied") {{
-            window.parent.Notification.requestPermission().then(function (permission) {{
-                if (permission === "granted") {{
-                    new window.parent.Notification("{title}", {{body: "{body}"}});
-                }}
-            }});
+    (() => {{
+      const parentWindow = window.parent;
+      const button = document.getElementById("mfr-enable");
+      const status = document.getElementById("mfr-status");
+      const soundUrl = {sound_url};
+
+      function updateStatus() {{
+        const enabled = parentWindow.localStorage.getItem("mfr_monitor_enabled") === "1";
+        const permission = ("Notification" in parentWindow)
+          ? parentWindow.Notification.permission : "unsupported";
+
+        if (enabled) {{
+          status.textContent = permission === "granted"
+            ? "✅ 監視音とWindows通知は有効です。"
+            : "✅ 監視音は有効です。Windows通知は未許可または利用できません。";
+          button.textContent = "🔊 もう一度、警告音と通知をテスト";
+          button.style.background = "#15803d";
         }}
-    }}
+      }}
+
+      button.addEventListener("click", async () => {{
+        parentWindow.localStorage.setItem("mfr_monitor_enabled", "1");
+        for (let i = parentWindow.localStorage.length - 1; i >= 0; i--) {{
+          const key = parentWindow.localStorage.key(i);
+          if (key && key.startsWith("mfr_notified_")) {{
+            parentWindow.localStorage.removeItem(key);
+          }}
+        }}
+
+        let permission = "unsupported";
+        try {{
+          if ("Notification" in parentWindow) {{
+            permission = parentWindow.Notification.permission;
+            if (permission === "default") {{
+              permission = await parentWindow.Notification.requestPermission();
+            }}
+          }}
+
+          const testAudio = new parentWindow.Audio(soundUrl);
+          testAudio.volume = 1.0;
+          await testAudio.play();
+          parentWindow.setTimeout(() => {{
+            testAudio.pause();
+            testAudio.currentTime = 0;
+          }}, 1400);
+
+          if (permission === "granted") {{
+            new parentWindow.Notification("MFR通知テスト", {{
+              body: "警告音とWindows通知の準備が完了しました。"
+            }});
+          }}
+          updateStatus();
+        }} catch (error) {{
+          status.textContent = "⚠️ 音声がブロックされました。Chromeのサイト設定で音声を許可してください。";
+        }}
+      }});
+
+      updateStatus();
+    }})();
     </script>
     """
-    components.html(js_code, height=0, width=0)
-# ★ここまで挿入
+    components.html(html, height=125, scrolling=False)
+
+
+def start_browser_alarm(alert_id, title, body):
+    """未確認の通知がある間、親ブラウザー側で警告音をループ再生する。"""
+    sound_url = json.dumps(get_alert_sound_data_url())
+    alert_id_js = json.dumps(alert_id, ensure_ascii=False)
+    title_js = json.dumps(title, ensure_ascii=False)
+    body_js = json.dumps(body, ensure_ascii=False)
+
+    html = f"""
+    <script>
+    (() => {{
+      const parentWindow = window.parent;
+      const alertId = {alert_id_js};
+      const title = {title_js};
+      const body = {body_js};
+      const soundUrl = {sound_url};
+      const enabled = parentWindow.localStorage.getItem("mfr_monitor_enabled") === "1";
+
+      if (!enabled) return;
+
+      if (!parentWindow.__mfrAlarmAudio || parentWindow.__mfrAlarmId !== alertId) {{
+        if (parentWindow.__mfrAlarmAudio) {{
+          parentWindow.__mfrAlarmAudio.pause();
+          parentWindow.__mfrAlarmAudio.currentTime = 0;
+        }}
+        const audio = new parentWindow.Audio(soundUrl);
+        audio.loop = true;
+        audio.volume = 1.0;
+        parentWindow.__mfrAlarmAudio = audio;
+        parentWindow.__mfrAlarmId = alertId;
+        audio.play().catch(() => {{
+          parentWindow.localStorage.setItem("mfr_audio_blocked", "1");
+        }});
+      }}
+
+      const notifyKey = "mfr_notified_" + alertId;
+      if (parentWindow.localStorage.getItem(notifyKey) !== "1" &&
+          "Notification" in parentWindow &&
+          parentWindow.Notification.permission === "granted") {{
+        new parentWindow.Notification(title, {{ body: body, requireInteraction: true }});
+        parentWindow.localStorage.setItem(notifyKey, "1");
+      }}
+    }})();
+    </script>
+    """
+    components.html(html, height=0, width=0)
+
+
+def stop_browser_alarm():
+    html = """
+    <script>
+    (() => {
+      const parentWindow = window.parent;
+      if (parentWindow.__mfrAlarmAudio) {
+        parentWindow.__mfrAlarmAudio.pause();
+        parentWindow.__mfrAlarmAudio.currentTime = 0;
+        parentWindow.__mfrAlarmAudio = null;
+        parentWindow.__mfrAlarmId = null;
+      }
+    })();
+    </script>
+    """
+    components.html(html, height=0, width=0)
+
 
 def get_measurement_text(num_targets, current_target_qty, targets):
     if num_targets == 2:
@@ -162,6 +314,22 @@ st.markdown(
     }
 
     .stButton button { width: 100%; border-radius: 5px; }
+
+    .mfr-active-alert {
+        background: #b91c1c;
+        color: white;
+        border: 5px solid #7f1d1d;
+        border-radius: 14px;
+        padding: 22px;
+        margin: 14px 0 10px 0;
+        text-align: center;
+        animation: mfr-pulse 1.2s infinite alternate;
+    }
+
+    @keyframes mfr-pulse {
+        from { box-shadow: 0 0 0 rgba(185, 28, 28, 0.2); }
+        to   { box-shadow: 0 0 28px rgba(185, 28, 28, 0.85); }
+    }
     
     /* 天井の余白設定 */
     .block-container { padding-top: 3.0rem !important; }
@@ -193,21 +361,37 @@ if 'initialized' not in st.session_state:
     if saved_state:
         st.session_state.jobs = saved_state['jobs']
         st.session_state.last_inspection_date = saved_state['last_inspection_date']
-        st.session_state.shown_alerts = saved_state.get('shown_alerts', [])
+        st.session_state.acknowledged_alerts = saved_state.get('acknowledged_alerts', [])
+        st.session_state.pending_power_off_due = saved_state.get('pending_power_off_due')
         # ★GitHubのデータがあれば最優先、なければローカルデータ
         st.session_state.products = gh_products if gh_products is not None else saved_state.get('products', {})
     else:
         st.session_state.jobs = {'100t': None, '450t': None, '550t': None}
         st.session_state.last_inspection_date = None
-        st.session_state.shown_alerts = []
+        st.session_state.acknowledged_alerts = []
+        st.session_state.pending_power_off_due = None
         default_products = {
             'サンプル製品A': {'machine': '100t', 'qty': 500, 'cycle': 60.0, 'measurements': 2},
             'サンプル製品B': {'machine': '450t', 'qty': 1000, 'cycle': 30.0, 'measurements': 3}
         }
         st.session_state.products = gh_products if gh_products is not None else default_products
         
+    # 既存保存データにも安定したジョブIDを追加（通知IDが毎回変わるのを防止）
+    for machine_name, saved_job in st.session_state.jobs.items():
+        if saved_job is not None and not saved_job.get('job_id'):
+            anchor = saved_job.get('last_update', datetime.utcnow() + timedelta(hours=9))
+            if not isinstance(anchor, datetime):
+                anchor = datetime.utcnow() + timedelta(hours=9)
+            saved_job['job_id'] = f"{machine_name}_{anchor.strftime('%Y%m%d%H%M%S')}"
+
     st.session_state.initialized = True
-    st.session_state.inspection_dialog_shown = False 
+    st.session_state.inspection_dialog_shown = False
+
+# コード更新中も既存ブラウザーセッションを安全に引き継ぐ
+if 'acknowledged_alerts' not in st.session_state:
+    st.session_state.acknowledged_alerts = []
+if 'pending_power_off_due' not in st.session_state:
+    st.session_state.pending_power_off_due = None
 
 # --- UI：サイドバー ---
 with st.sidebar:
@@ -275,10 +459,15 @@ with st.sidebar:
     st.subheader("🔧 リセット・テスト用ツール")
     if st.button("🔄 すべての成型機の状態をリセット"):
         st.session_state.jobs = {'100t': None, '450t': None, '550t': None}
+        st.session_state.pending_power_off_due = None
         save_state(); st.rerun()
         
     if st.button("🔄 今日の点検状態を未実施に戻す"):
         st.session_state.last_inspection_date = None; st.session_state.inspection_dialog_shown = False
+        save_state(); st.rerun()
+
+    if st.button("🔕 通知の確認履歴をリセット（テスト用）"):
+        st.session_state.acknowledged_alerts = []
         save_state(); st.rerun()
 
 # --- 事前計算ロジック ---
@@ -295,7 +484,7 @@ def calculate_upcoming_measurements():
             if target not in job['completed']:
                 if job['status'] == 'Running':
                     remaining_qty = target - job['current_qty']
-                    if remaining_qty <= 0: est_time = now
+                    if remaining_qty <= 0: est_time = job['last_update']
                     else: est_time = job['last_update'] + timedelta(seconds=remaining_qty * job['cycle_time'])
                 elif job['status'] == 'Paused':
                     est_time = None 
@@ -314,7 +503,7 @@ def calculate_upcoming_measurements():
             continue
         is_monday_d = (d.weekday() == 0)
         insp_time = datetime(d.year, d.month, d.day, 8 if is_monday_d else 7, 0, 0)
-        est_time_insp = now if d == today_date and now >= insp_time else insp_time
+        est_time_insp = insp_time
         upcoming.append({
             'machine': '日常点検(A勤)', 'target_qty': '日常点検',
             'est_time': est_time_insp, 'status': 'Planned', 'Targets': ['日常点検']
@@ -334,69 +523,116 @@ if valid_upcoming:
         next_measure = valid_upcoming[i]['est_time']
         gap_minutes = (next_measure - current_end).total_seconds() / 60
         if gap_minutes >= 90:
-            on_blocks.append((current_start, current_end))
+            on_blocks.append((current_start, current_end + timedelta(minutes=10)))
             current_start = next_measure - timedelta(minutes=60)
             current_end = next_measure
         else:
             current_end = next_measure
-    on_blocks.append((current_start, current_end))
+    on_blocks.append((current_start, current_end + timedelta(minutes=10)))
 
 # --- アラーム・ダイアログ通知 ---
+# 「表示しただけ」では消さず、作業者が［確認しました］を押すまで active_alerts に残します。
+active_alerts = []
 
-# 1. 始業時点検確認
-inspection_start_time = datetime.combine(today_date, dt_time(7, 0, 0))
+is_monday = (today_date.weekday() == 0)
+inspection_start_hour = 8 if is_monday else 7
+inspection_start_time = datetime.combine(today_date, dt_time(inspection_start_hour, 0, 0))
 inspection_end_time = datetime.combine(today_date, dt_time(10, 0, 0))
 
-if st.session_state.last_inspection_date != today_date:
-    if now >= inspection_end_time:
-        st.session_state.last_inspection_date = today_date
-        save_state()
-        st.rerun()
-    elif inspection_start_time <= now < inspection_end_time:
-        if not st.session_state.get('inspection_dialog_shown', False):
-            st.session_state.inspection_dialog_shown = True
-            st.toast("📋 本日の日常点検（MFR測定）は既に完了していますか？下部のボタンから記録してください。", icon="⚠️")
+# 1. 日常点検（10時を過ぎても自動完了にはしない）
+if st.session_state.last_inspection_date != today_date and now >= inspection_start_time:
+    inspection_alert_id = f"INSP_{today_date.strftime('%Y%m%d')}"
+    if inspection_alert_id not in st.session_state.acknowledged_alerts:
+        active_alerts.append({
+            "id": inspection_alert_id,
+            "due": inspection_start_time,
+            "title": "📋 日常点検アラート",
+            "message": f"本日の日常点検が未完了です。予定時刻は {inspection_start_time.strftime('%H:%M')} です。",
+            "kind": "inspection",
+        })
 
-# 2. 測定実行のアラーム
+# 2. MFR測定（予定時刻から15分を過ぎても、確認されるまで警告を継続）
 for pt in valid_upcoming:
+    if pt['machine'] == '日常点検(A勤)':
+        continue
+
     m_time = pt['est_time']
-    if m_time <= now < m_time + timedelta(minutes=15):
-        if pt['machine'] == '日常点検(A勤)':
-            alert_id_meas = f"MEAS_INSP_{m_time.strftime('%Y%m%d_%H%M')}"
-            msg_meas = "📋 日常点検の時間です！点検を実施してください。"
-        else:
-            meas_text = get_measurement_text(len(pt['Targets']), pt['target_qty'], pt['Targets'])
-            alert_id_meas = f"MEAS_{pt['machine']}_{meas_text}_{m_time.strftime('%Y%m%d_%H%M')}"
-            msg_meas = f"🎯 {pt['machine']} 成型機（{meas_text}）のMFR測定を実施してください！"
+    if m_time <= now:
+        job = st.session_state.jobs.get(pt['machine'])
+        if job is None:
+            continue
 
-        if alert_id_meas not in st.session_state.shown_alerts:
-            st.session_state.shown_alerts.append(alert_id_meas); save_state()
-            st.toast(msg_meas, icon="🚨")
-            show_desktop_notify("🎯 MFR測定アラート", msg_meas)  # ★この1行を追加
-            play_alert_sound("alert.mp3")  # ★ここを挿入（用意した音声ファイル名を指定）
+        meas_text = get_measurement_text(len(pt['Targets']), pt['target_qty'], pt['Targets'])
+        job_id = job.get('job_id', pt['machine'])
+        alert_id_meas = f"MEAS_{job_id}_{pt['target_qty']}"
 
-# 3. 電源ON・OFFアラーム
-for b_start, b_end in on_blocks:
-    if b_start <= now < b_end:
+        if alert_id_meas not in st.session_state.acknowledged_alerts:
+            active_alerts.append({
+                "id": alert_id_meas,
+                "due": m_time,
+                "title": "🎯 MFR測定アラート",
+                "message": (
+                    f"{pt['machine']} 成型機（{meas_text}）のMFR測定時刻です。"
+                    f" 予定時刻：{m_time.strftime('%m/%d %H:%M')}"
+                ),
+                "kind": "measurement",
+            })
+
+# 3. 電源ON・OFF
+# on_blocks の終了時刻には、最終測定後10分の冷却時間を含めています。
+for b_start, b_off in on_blocks:
+    target_tasks = [
+        x['machine'] for x in valid_upcoming
+        if x['est_time'] is not None and b_start <= x['est_time'] <= b_off
+    ]
+    target_machine = target_tasks[0] if target_tasks else "成型機"
+
+    if b_start <= now < b_off:
         alert_id_on = f"ON_{b_start.strftime('%Y%m%d_%H%M')}"
-        if alert_id_on not in st.session_state.shown_alerts:
-            st.session_state.shown_alerts.append(alert_id_on); save_state()
-            target_tasks = [x['machine'] for x in valid_upcoming if b_start <= x['est_time'] <= b_end]
-            target_machine = target_tasks[0] if target_tasks else "成型機"
-            scheduled_time_str = (b_start + timedelta(minutes=60)).strftime('%H:%M')
-            
-            msg_on = f"🔥 MFR測定器 電源ON！（{target_machine} {scheduled_time_str} 予定）"
-            st.toast(msg_on, icon="🔥")
-            show_desktop_notify("🔥 電源操作アラート", msg_on) # ★この1行を追加
+        if alert_id_on not in st.session_state.acknowledged_alerts:
+            first_measure_time = b_start + timedelta(minutes=60)
+            active_alerts.append({
+                "id": alert_id_on,
+                "due": b_start,
+                "title": "🔥 MFR電源ONアラート",
+                "message": (
+                    f"MFR測定器の電源をONにしてください。"
+                    f" 対象：{target_machine}／最初の予定：{first_measure_time.strftime('%m/%d %H:%M')}"
+                ),
+                "kind": "power_on",
+            })
 
-    if b_end + timedelta(minutes=3) <= now < b_end + timedelta(minutes=18):
-        alert_id_off = f"OFF_{b_end.strftime('%Y%m%d_%H%M')}"
-        if alert_id_off not in st.session_state.shown_alerts:
-            st.session_state.shown_alerts.append(alert_id_off); save_state()
-            
-            msg_off = "💤 MFR測定器 電源OFF！（測定完了・冷却開始）"
-            st.toast(msg_off, icon="💤")
-            show_desktop_notify("💤 電源操作アラート", msg_off) # ★この1行を追加
+# 4. 実際の測定・点検完了から10分後の電源OFF
+pending_off_due = st.session_state.pending_power_off_due
+if pending_off_due is not None:
+    # 未完了の測定が90分以内に残る場合は、電源を維持するためOFF予約を取り消す
+    completion_time = pending_off_due - timedelta(minutes=10)
+    keep_power_on = any(
+        item['est_time'] is not None
+        and item['est_time'] <= completion_time + timedelta(minutes=90)
+        for item in valid_upcoming
+    )
+
+    if keep_power_on:
+        st.session_state.pending_power_off_due = None
+        save_state()
+    elif now >= pending_off_due:
+        alert_id_off = f"OFF_ACTUAL_{pending_off_due.strftime('%Y%m%d_%H%M')}"
+        if alert_id_off not in st.session_state.acknowledged_alerts:
+            active_alerts.append({
+                "id": alert_id_off,
+                "due": pending_off_due,
+                "title": "💤 MFR電源OFFアラート",
+                "message": (
+                    f"最後の測定・点検完了から10分経過しました。"
+                    f"MFR測定器の電源をOFFにしてください。"
+                    f" 予定時刻：{pending_off_due.strftime('%m/%d %H:%M')}"
+                ),
+                "kind": "power_off",
+            })
+
+active_alerts.sort(key=lambda item: item["due"])
+
 
 # --- UI：ヘッダー（QRシステムと同じサイズ感に統一） ---
 try:
@@ -411,28 +647,83 @@ try:
 except:
     st.title("MFRスマート電源管理システム")
 
-st.write(f"現在時刻: **{now.strftime('%Y/%m/%d %H:%M:%S')}** (60秒ごとに自動更新中 🔄)")
+st.write(f"現在時刻: **{now.strftime('%Y/%m/%d %H:%M:%S')}** (10秒ごとに自動更新中 🔄)")
+
+st.subheader("🔔 Chrome通知・警告音")
+render_monitor_activation()
+
+if active_alerts:
+    primary_alert = active_alerts[0]
+    start_browser_alarm(
+        primary_alert["id"],
+        primary_alert["title"],
+        primary_alert["message"],
+    )
+
+    overdue_minutes = max(0, int((now - primary_alert["due"]).total_seconds() // 60))
+    st.markdown(
+        f"""
+        <div class="mfr-active-alert">
+            <div style="font-size:1.7rem;font-weight:800;">{primary_alert["title"]}</div>
+            <div style="font-size:1.25rem;margin-top:8px;">{primary_alert["message"]}</div>
+            <div style="font-size:1rem;margin-top:8px;">予定から {overdue_minutes} 分経過</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button(
+        "✅ 確認しました（警告音を停止）",
+        key=f"ack_{primary_alert['id']}",
+        type="primary",
+    ):
+        st.session_state.acknowledged_alerts.append(primary_alert["id"])
+        if primary_alert["kind"] == "power_off":
+            st.session_state.pending_power_off_due = None
+        save_state()
+        stop_browser_alarm()
+        st.rerun()
+
+    if len(active_alerts) > 1:
+        with st.expander(f"ほかに未確認の通知が {len(active_alerts) - 1} 件あります"):
+            for pending in active_alerts[1:]:
+                st.write(
+                    f"・{pending['due'].strftime('%m/%d %H:%M')} "
+                    f"{pending['title']}：{pending['message']}"
+                )
+else:
+    stop_browser_alarm()
+    st.success("✅ 現在、未確認の警告はありません。")
+
+st.caption("※シフト開始時に青いボタンを1回押してください。Chromeは閉じず、Excelの後ろで開いたままにします。")
 st.markdown("---")
 
 # --- MFR電源ステータス ---
 st.header("💡 MFR測定器 電源ステータス") # ★ headerに格上げ
 is_monday = (today_date.weekday() == 0)
 
-inspection_start_time = datetime.combine(today_date, dt_time(7, 0, 0))
+inspection_start_time = datetime.combine(today_date, dt_time(8 if is_monday else 7, 0, 0))
 inspection_end_time = datetime.combine(today_date, dt_time(10, 0, 0))
 
 if st.session_state.last_inspection_date == today_date:
     st.success("✅ 本日の日常点検は完了しています。")
 else:
-    if inspection_start_time <= now < inspection_end_time:
-        if is_monday: st.error("⚠️ 【至急】本日の日常点検が未完了です！ MFR電源をONにして点検を実施してください。（月曜は朝8:00）")
-        else: st.error("⚠️ 【至急】本日の日常点検が未完了です！ MFR電源をONにして点検を実施してください。（火〜金は朝7:00）")
+    if now >= inspection_start_time:
+        if is_monday:
+            st.error("⚠️ 【至急】本日の日常点検が未完了です！ MFR電源をONにして点検を実施してください。（月曜は朝8:00）")
+        else:
+            st.error("⚠️ 【至急】本日の日常点検が未完了です！ MFR電源をONにして点検を実施してください。（火〜日は朝7:00）")
         if st.button("📝 点検が終わったので完了を記録する"):
-            st.session_state.last_inspection_date = today_date; save_state(); st.rerun()
-            
-    elif now < inspection_start_time:
-        if is_monday: st.warning("📋 本日の日常点検が未完了です。（月曜は朝8:00開始）")
-        else: st.warning("📋 本日の日常点検が未完了です。（火〜金は朝7:00開始）")
+            st.session_state.last_inspection_date = today_date
+            st.session_state.pending_power_off_due = now + timedelta(minutes=10)
+            save_state()
+            st.rerun()
+    else:
+        if is_monday:
+            st.warning("📋 本日の日常点検が未完了です。（月曜は朝8:00開始）")
+        else:
+            st.warning("📋 本日の日常点検が未完了です。（火〜日は朝7:00開始）")
+
 st.markdown("---")
 
 if not valid_upcoming:
@@ -482,9 +773,11 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 completed = st.multiselect("既に測定済みのポイント", options=targets, default=default_completed, format_func=lambda x: f"{x}個目", key=f"comp_sel_{machine}")
 
                 if st.button("▶️ 生産スタート", key=f"start_btn_{machine}"):
+                    start_timestamp = datetime.utcnow() + timedelta(hours=9)
                     st.session_state.jobs[machine] = {
+                        'job_id': f"{machine}_{start_timestamp.strftime('%Y%m%d%H%M%S')}",
                         'product_name': product_name, 'total_qty': total_qty, 'cycle_time': cycle_time,
-                        'current_qty': current_qty, 'last_update': (datetime.utcnow() + timedelta(hours=9)),
+                        'current_qty': current_qty, 'last_update': start_timestamp,
                         'targets': targets, 'completed': completed, 'status': 'Running'
                     }
                     save_state(); st.rerun()
@@ -533,6 +826,11 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                             job['last_update'] = (datetime.utcnow() + timedelta(hours=9))
                             
                         job['completed'].append(t)
+                        # 実際の測定完了から10分後に電源OFF候補を作成。
+                        # 90分以内に次の測定がある場合は、次回更新時に自動取消します。
+                        st.session_state.pending_power_off_due = (
+                            datetime.utcnow() + timedelta(hours=9, minutes=10)
+                        )
                         if len(job['completed']) == len(job['targets']): 
                             job['status'] = 'Completed'
                             job['current_qty'] = job['total_qty']
@@ -847,7 +1145,6 @@ with st.expander("📊 現在のスケジュールにおける削減効果金額
             fig_eco.add_annotation(x="❌ 従来の運用 (ずっとON)", y=total_old, yshift=15, yanchor="bottom", text=f"<b>計 {int(total_old):,} 円</b>", showarrow=False, font=dict(size=22))
             fig_eco.add_annotation(x="✨ EcoNavi スマート運用", y=total_new, yshift=15, yanchor="bottom", text=f"<b>計 {int(total_new):,} 円</b>", showarrow=False, font=dict(size=22, color="#00a82d"))
 
-            import math
             approx_dx_px = 500  
             approx_dy_px = ((total_old - total_new) / (total_old * 1.5)) * 400 
             
