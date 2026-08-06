@@ -1,3 +1,4 @@
+# Version 1.4.7: 通知音をWeb Audio API直接生成方式へ変更
 # Version 1.4.6: 通知音診断とブラウザー再生処理を強化
 # Version 1.4.5: 通知音キャッシュ・参照先・ブラウザーAudioを修正
 # Version 1.4.4: 通知音をクリスタルライズへ変更
@@ -113,7 +114,7 @@ ALERT_SOUND_FILE = os.path.join(
     "alert_crystal_rise.wav",
 )
 ALERT_SOUND_NAME = "クリスタルライズ"
-ALERT_SOUND_VERSION = "crystal_rise_1_4_5"
+ALERT_SOUND_VERSION = "crystal_rise_webaudio_1_4_7"
 
 # 未確認中のWindows通知を再表示する間隔。
 # Excelを前面で使用していても気づきやすいよう、30秒ごとに再通知します。
@@ -266,11 +267,11 @@ def get_alert_sound_diagnostics():
 
 def render_monitor_activation():
     """
-    始業時にクリックして、音声再生とWindows通知権限を有効にする。
+    始業時にクリックして、Web Audio APIとWindows通知を有効にする。
 
-    テスト音はクリックされた同じiframe内のaudio要素から再生する。
+    WAVやBase64 Data URLは使用せず、Chrome内部で
+    クリスタルライズ音を直接生成する。
     """
-    sound_url = json.dumps(get_current_alert_sound_data_url())
     sound_name_js = json.dumps(ALERT_SOUND_NAME, ensure_ascii=False)
     sound_version_js = json.dumps(ALERT_SOUND_VERSION)
 
@@ -287,8 +288,6 @@ def render_monitor_activation():
               font-weight:bold;color:#1f2937;white-space:pre-wrap;">
         シフト開始時に上のボタンを1回押してください。
       </div>
-
-      <audio id="mfr-test-audio" preload="auto" src={sound_url}></audio>
     </div>
 
     <script>
@@ -296,7 +295,6 @@ def render_monitor_activation():
       const parentWindow = window.parent;
       const button = document.getElementById("mfr-enable");
       const status = document.getElementById("mfr-status");
-      const testAudio = document.getElementById("mfr-test-audio");
       const soundName = {sound_name_js};
       const soundVersion = {sound_version_js};
 
@@ -304,42 +302,254 @@ def render_monitor_activation():
         status.textContent = message;
       }}
 
+      function installCrystalRiseEngine() {{
+        if (parentWindow.__mfrCrystalRiseInstalled === soundVersion) {{
+          return;
+        }}
+
+        // 旧版の音声ループやAudio要素が残っていたら停止・削除する。
+        if (parentWindow.__mfrCrystalRiseTimer) {{
+          parentWindow.clearInterval(
+            parentWindow.__mfrCrystalRiseTimer
+          );
+          parentWindow.__mfrCrystalRiseTimer = null;
+        }}
+
+        const oldAudio =
+          parentWindow.document.getElementById(
+            "mfr-global-alarm-audio"
+          );
+        if (oldAudio) {{
+          try {{
+            oldAudio.pause();
+            oldAudio.removeAttribute("src");
+            oldAudio.load();
+            oldAudio.remove();
+          }} catch (error) {{}}
+        }}
+
+        parentWindow.__mfrCrystalRiseInstalled = soundVersion;
+        parentWindow.__mfrCrystalRiseAlertId = null;
+        parentWindow.__mfrCrystalRiseSources = [];
+
+        parentWindow.__mfrGetAudioContext = function() {{
+          const AudioContextClass =
+            parentWindow.AudioContext
+            || parentWindow.webkitAudioContext;
+
+          if (!AudioContextClass) {{
+            throw new Error(
+              "このブラウザーはWeb Audio APIに対応していません。"
+            );
+          }}
+
+          if (
+            !parentWindow.__mfrAudioContext
+            || parentWindow.__mfrAudioContext.state === "closed"
+          ) {{
+            parentWindow.__mfrAudioContext =
+              new AudioContextClass();
+          }}
+
+          return parentWindow.__mfrAudioContext;
+        }};
+
+        parentWindow.__mfrStopActiveCrystalSources = function() {{
+          const sources =
+            parentWindow.__mfrCrystalRiseSources || [];
+
+          for (const oscillator of sources) {{
+            try {{
+              oscillator.stop();
+            }} catch (error) {{}}
+          }}
+
+          parentWindow.__mfrCrystalRiseSources = [];
+        }};
+
+        parentWindow.__mfrPlayCrystalRiseOnce = async function() {{
+          const audioContext =
+            parentWindow.__mfrGetAudioContext();
+
+          if (audioContext.state === "suspended") {{
+            await audioContext.resume();
+          }}
+
+          const now = audioContext.currentTime + 0.03;
+
+          const compressor =
+            audioContext.createDynamicsCompressor();
+          compressor.threshold.setValueAtTime(-18, now);
+          compressor.knee.setValueAtTime(14, now);
+          compressor.ratio.setValueAtTime(5, now);
+          compressor.attack.setValueAtTime(0.003, now);
+          compressor.release.setValueAtTime(0.30, now);
+          compressor.connect(audioContext.destination);
+
+          const master = audioContext.createGain();
+          master.gain.setValueAtTime(0.78, now);
+          master.connect(compressor);
+
+          // C5 → E5 → G5 → C6 ＋ 高音のきらめき
+          const events = [
+            {{ start: 0.00, frequency: 523.25, duration: 1.15, level: 0.62 }},
+            {{ start: 0.20, frequency: 659.25, duration: 1.15, level: 0.66 }},
+            {{ start: 0.40, frequency: 783.99, duration: 1.15, level: 0.70 }},
+            {{ start: 0.65, frequency: 1046.50, duration: 1.15, level: 0.76 }},
+            {{ start: 0.88, frequency: 1567.98, duration: 0.55, level: 0.30 }}
+          ];
+
+          const partials = [
+            {{ multiple: 1.00, level: 1.00 }},
+            {{ multiple: 2.01, level: 0.34 }},
+            {{ multiple: 3.97, level: 0.15 }},
+            {{ multiple: 6.10, level: 0.055 }}
+          ];
+
+          for (const event of events) {{
+            const eventStart = now + event.start;
+            const eventEnd =
+              eventStart + event.duration;
+
+            for (const partial of partials) {{
+              const oscillator =
+                audioContext.createOscillator();
+              const gain = audioContext.createGain();
+
+              oscillator.type = "sine";
+              oscillator.frequency.setValueAtTime(
+                event.frequency * partial.multiple,
+                eventStart
+              );
+
+              const peak =
+                Math.max(
+                  0.0002,
+                  event.level * partial.level * 0.18
+                );
+
+              gain.gain.setValueAtTime(
+                0.0001,
+                eventStart
+              );
+              gain.gain.exponentialRampToValueAtTime(
+                peak,
+                eventStart + 0.010
+              );
+              gain.gain.exponentialRampToValueAtTime(
+                0.0001,
+                eventEnd
+              );
+
+              oscillator.connect(gain);
+              gain.connect(master);
+
+              parentWindow.__mfrCrystalRiseSources.push(
+                oscillator
+              );
+
+              oscillator.onended = () => {{
+                parentWindow.__mfrCrystalRiseSources =
+                  (
+                    parentWindow.__mfrCrystalRiseSources
+                    || []
+                  ).filter(
+                    item => item !== oscillator
+                  );
+              }};
+
+              oscillator.start(eventStart);
+              oscillator.stop(eventEnd + 0.03);
+            }}
+          }}
+
+          return audioContext.state;
+        }};
+
+        parentWindow.__mfrStopCrystalRiseLoop = function() {{
+          if (parentWindow.__mfrCrystalRiseTimer) {{
+            parentWindow.clearInterval(
+              parentWindow.__mfrCrystalRiseTimer
+            );
+            parentWindow.__mfrCrystalRiseTimer = null;
+          }}
+
+          parentWindow.__mfrCrystalRiseAlertId = null;
+          parentWindow.__mfrStopActiveCrystalSources();
+        }};
+
+        parentWindow.__mfrStartCrystalRiseLoop =
+          async function(alertId) {{
+            if (
+              parentWindow.__mfrCrystalRiseTimer
+              && parentWindow.__mfrCrystalRiseAlertId === alertId
+            ) {{
+              return;
+            }}
+
+            parentWindow.__mfrStopCrystalRiseLoop();
+            parentWindow.__mfrCrystalRiseAlertId = alertId;
+
+            await parentWindow.__mfrPlayCrystalRiseOnce();
+
+            parentWindow.__mfrCrystalRiseTimer =
+              parentWindow.setInterval(() => {{
+                parentWindow.__mfrPlayCrystalRiseOnce()
+                  .catch((error) => {{
+                    parentWindow.localStorage.setItem(
+                      "mfr_audio_error",
+                      `${{error?.name || "AudioError"}}: `
+                      + `${{error?.message || String(error)}}`
+                    );
+                  }});
+              }}, 4200);
+          }};
+      }}
+
       button.addEventListener("click", async () => {{
         try {{
-          parentWindow.localStorage.setItem("mfr_monitor_enabled", "1");
+          installCrystalRiseEngine();
+
+          parentWindow.localStorage.setItem(
+            "mfr_monitor_enabled",
+            "1"
+          );
           parentWindow.localStorage.setItem(
             "mfr_alert_sound_version",
             soundVersion
           );
+          parentWindow.localStorage.removeItem(
+            "mfr_audio_error"
+          );
 
           let permission = "unsupported";
+
           if ("Notification" in parentWindow) {{
-            permission = parentWindow.Notification.permission;
+            permission =
+              parentWindow.Notification.permission;
+
             if (permission === "default") {{
               permission =
-                await parentWindow.Notification.requestPermission();
+                await parentWindow.Notification
+                  .requestPermission();
             }}
           }}
 
-          testAudio.pause();
-          testAudio.currentTime = 0;
-          testAudio.muted = false;
-          testAudio.volume = 1.0;
-          await testAudio.play();
-
-          parentWindow.setTimeout(() => {{
-            testAudio.pause();
-            testAudio.currentTime = 0;
-          }}, 3500);
+          const contextState =
+            await parentWindow.__mfrPlayCrystalRiseOnce();
 
           if (permission === "granted") {{
             const notification =
-              new parentWindow.Notification("MFR通知テスト", {{
-                body:
-                  `通知音「${{soundName}}」とWindows通知の準備が完了しました。`,
-                tag: "mfr-notification-test",
-                requireInteraction: true
-              }});
+              new parentWindow.Notification(
+                "MFR通知テスト",
+                {{
+                  body:
+                    `通知音「${{soundName}}」と`
+                    + "Windows通知の準備が完了しました。",
+                  tag: "mfr-notification-test",
+                  requireInteraction: true
+                }}
+              );
 
             notification.onclick = () => {{
               parentWindow.focus();
@@ -349,15 +559,20 @@ def render_monitor_activation():
 
           setStatus(
             `✅ 通知音「${{soundName}}」を再生しました。\\n`
+            + "再生方式：Web Audio API（WAV不使用）\\n"
+            + `AudioContext：${{contextState}}\\n`
             + `音色バージョン：${{soundVersion}}`
           );
+
           button.textContent =
             `🔊 通知音「${{soundName}}」をもう一度テスト`;
           button.style.background = "#15803d";
 
         }} catch (error) {{
-          const errorName = error?.name || "UnknownError";
-          const errorMessage = error?.message || String(error);
+          const errorName =
+            error?.name || "UnknownError";
+          const errorMessage =
+            error?.message || String(error);
 
           setStatus(
             "⚠️ 通知音を再生できませんでした。\\n"
@@ -366,24 +581,26 @@ def render_monitor_activation():
             + "Chromeのタブミュート、サイトの音声設定、"
             + "Windows音量を確認してください。"
           );
+
           button.style.background = "#b91c1c";
         }}
       }});
+
+      // 同じページ内の再描画では既存エンジンを再利用する。
+      installCrystalRiseEngine();
     }})();
     </script>
     """
 
-    components.html(html, height=165, scrolling=False)
+    components.html(html, height=190, scrolling=False)
 
 
 
 def start_browser_alarm(alert_id, title, body):
     """
-    未確認通知がある間、通知音をループし、
+    未確認通知がある間、Web Audio APIの通知音をループし、
     Windows通知を30秒ごとに再表示する。
     """
-    sound_url = json.dumps(get_current_alert_sound_data_url())
-    sound_version_js = json.dumps(ALERT_SOUND_VERSION)
     alert_id_js = json.dumps(alert_id, ensure_ascii=False)
     title_js = json.dumps(title, ensure_ascii=False)
     body_js = json.dumps(body, ensure_ascii=False)
@@ -396,64 +613,54 @@ def start_browser_alarm(alert_id, title, body):
       const alertId = {alert_id_js};
       const title = {title_js};
       const body = {body_js};
-      const soundUrl = {sound_url};
-      const soundVersion = {sound_version_js};
       const repeatMs = {repeat_ms_js};
 
       const enabled =
-        parentWindow.localStorage.getItem("mfr_monitor_enabled") === "1";
+        parentWindow.localStorage.getItem(
+          "mfr_monitor_enabled"
+        ) === "1";
 
       if (!enabled) return;
 
-      let audio =
-        parentWindow.document.getElementById("mfr-global-alarm-audio");
-
-      if (!audio) {{
-        audio = parentWindow.document.createElement("audio");
-        audio.id = "mfr-global-alarm-audio";
-        audio.style.display = "none";
-        audio.preload = "auto";
-        parentWindow.document.body.appendChild(audio);
+      if (
+        typeof parentWindow.__mfrStartCrystalRiseLoop
+        === "function"
+      ) {{
+        parentWindow.__mfrStartCrystalRiseLoop(alertId)
+          .then(() => {{
+            parentWindow.localStorage.removeItem(
+              "mfr_audio_error"
+            );
+          }})
+          .catch((error) => {{
+            parentWindow.localStorage.setItem(
+              "mfr_audio_error",
+              `${{error?.name || "AudioError"}}: `
+              + `${{error?.message || String(error)}}`
+            );
+          }});
+      }} else {{
+        parentWindow.localStorage.setItem(
+          "mfr_audio_error",
+          "通知音エンジンが未準備です。"
+          + "青い監視開始ボタンを押してください。"
+        );
       }}
 
-      const needsReplacement =
-        audio.dataset.alertId !== alertId
-        || audio.dataset.soundVersion !== soundVersion;
-
-      if (needsReplacement) {{
-        audio.pause();
-        audio.currentTime = 0;
-        audio.src = soundUrl;
-        audio.dataset.alertId = alertId;
-        audio.dataset.soundVersion = soundVersion;
-        audio.loop = true;
-        audio.muted = false;
-        audio.volume = 1.0;
-        audio.load();
-      }}
-
-      if (audio.paused) {{
-        audio.play().then(() => {{
-          parentWindow.localStorage.removeItem("mfr_audio_error");
-        }}).catch((error) => {{
-          parentWindow.localStorage.setItem(
-            "mfr_audio_error",
-            `${{error?.name || "UnknownError"}}: `
-            + `${{error?.message || String(error)}}`
-          );
-        }});
-      }}
-
-      const notifyTimeKey = "mfr_notify_time_" + alertId;
+      const notifyTimeKey =
+        "mfr_notify_time_" + alertId;
       const lastNotifyTime = Number(
-        parentWindow.localStorage.getItem(notifyTimeKey) || "0"
+        parentWindow.localStorage.getItem(
+          notifyTimeKey
+        ) || "0"
       );
       const currentTime = Date.now();
 
       if (
         currentTime - lastNotifyTime >= repeatMs
         && "Notification" in parentWindow
-        && parentWindow.Notification.permission === "granted"
+        && parentWindow.Notification.permission
+          === "granted"
       ) {{
         if (parentWindow.__mfrNotification) {{
           try {{
@@ -461,20 +668,28 @@ def start_browser_alarm(alert_id, title, body):
           }} catch (error) {{}}
         }}
 
-        const notification = new parentWindow.Notification(title, {{
-          body: body + "\\n未確認のため再通知しています。",
-          tag: "mfr-" + alertId,
-          requireInteraction: true,
-          renotify: true,
-          timestamp: currentTime
-        }});
+        const notification =
+          new parentWindow.Notification(
+            title,
+            {{
+              body:
+                body
+                + "\\n未確認のため再通知しています。",
+              tag: "mfr-" + alertId,
+              requireInteraction: true,
+              renotify: true,
+              timestamp: currentTime
+            }}
+          );
 
         notification.onclick = () => {{
           parentWindow.focus();
           notification.close();
         }};
 
-        parentWindow.__mfrNotification = notification;
+        parentWindow.__mfrNotification =
+          notification;
+
         parentWindow.localStorage.setItem(
           notifyTimeKey,
           String(currentTime)
@@ -493,21 +708,33 @@ def stop_browser_alarm():
     <script>
     (() => {
       const parentWindow = window.parent;
-      const audio =
-        parentWindow.document.getElementById("mfr-global-alarm-audio");
 
-      if (audio) {
-        audio.pause();
-        audio.currentTime = 0;
-        audio.removeAttribute("src");
-        audio.load();
-        audio.remove();
+      if (
+        typeof parentWindow.__mfrStopCrystalRiseLoop
+        === "function"
+      ) {
+        parentWindow.__mfrStopCrystalRiseLoop();
+      }
+
+      const oldAudio =
+        parentWindow.document.getElementById(
+          "mfr-global-alarm-audio"
+        );
+
+      if (oldAudio) {
+        try {
+          oldAudio.pause();
+          oldAudio.removeAttribute("src");
+          oldAudio.load();
+          oldAudio.remove();
+        } catch (error) {}
       }
 
       if (parentWindow.__mfrNotification) {
         try {
           parentWindow.__mfrNotification.close();
         } catch (error) {}
+
         parentWindow.__mfrNotification = null;
       }
     })();
@@ -894,23 +1121,20 @@ sound_diagnostics = get_alert_sound_diagnostics()
 
 st.caption(
     f"現在の通知音：{ALERT_SOUND_NAME} "
-    f"（{sound_diagnostics['type']}／"
-    f"{sound_diagnostics['name']}／"
-    f"{sound_diagnostics['size']:,} byte／"
-    f"識別番号 {sound_diagnostics['hash'][:12]}）"
+    "（Web Audio APIによるブラウザー直接生成／WAV不使用）"
 )
 
 render_monitor_activation()
 
-with st.expander("🔍 通知音ファイルの診断・手動試聴", expanded=False):
+with st.expander("🔍 参考WAVの手動試聴", expanded=False):
     st.write(f"読み込み元：**{sound_diagnostics['name']}**")
     st.write(f"ファイル容量：**{sound_diagnostics['size']:,} byte**")
     st.write(f"SHA-256：`{sound_diagnostics['hash']}`")
     st.audio(sound_diagnostics["bytes"], format="audio/wav")
     st.caption(
-        "この標準プレーヤーでも音が出ない場合は、"
-        "Chromeのタブミュート、サイトの音声設定、"
-        "Windows音量設定を確認してください。"
+        "このWAVは音色確認用です。実際の通知はWAVを使用せず、"
+        "ChromeのWeb Audio APIで同じクリスタルライズ音を"
+        "直接生成します。"
     )
 
 if active_alerts:
