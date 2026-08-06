@@ -1,3 +1,4 @@
+# Version 1.4.3: アプリ画面のLot表記統一
 # Version 1.4.2: EcoNavi金額ラベル固定サイズ対応（小額でも18px表示）
 # Version 1.4.1: EcoNaviデフォルト値（電気25円、修繕費0円、周期0時間）
 import streamlit as st
@@ -1232,7 +1233,7 @@ with st.expander(
 
     with col_manual_time:
         manual_minutes_per_job = st.number_input(
-            "システムなしの管理時間 (分/JOB)",
+            "システムなしの管理時間 (分/Lot)",
             min_value=0.0,
             value=5.0,
             step=0.5,
@@ -1246,7 +1247,7 @@ with st.expander(
     with col_system_time:
         st.metric(
             "システム使用時の管理時間",
-            "0.0 分/JOB",
+            "0.0 分/Lot",
             "時刻を自動算出",
             help=(
                 "システムが測定時刻と電源ON/OFF時刻を自動算出するため、"
@@ -1296,7 +1297,7 @@ with st.expander(
         )
         saved_hours = max(0.0, total_hours - new_on_hours)
 
-        # 現在登録されているJOB数を管理工数の対象とする。
+        # 現在登録されているLot数を管理工数の対象とする。
         managed_job_count = sum(
             1
             for job in st.session_state.jobs.values()
@@ -1340,7 +1341,7 @@ with st.expander(
             st.success(
                 f"✨ **現在のスケジュール期間中"
                 f"（約 {total_hours:.1f} 時間・"
-                f"{managed_job_count} JOB）の改善効果**"
+                f"{managed_job_count} Lot）の改善効果**"
             )
 
             res_col1, res_col2, res_col3, res_col4 = st.columns(4)
@@ -1363,7 +1364,7 @@ with st.expander(
             )
             help_labor = (
                 "【システムなし】\n"
-                "現在のJOB数 × 手作業の管理時間(分/JOB)"
+                "現在のLot数 × 手作業の管理時間(分/Lot)"
                 " ÷ 60 × 労務費(円/h)\n\n"
                 "【システム使用】\n"
                 "測定時刻・電源ON/OFF時刻を自動算出するため0円\n\n"
@@ -1441,7 +1442,7 @@ with st.expander(
                     "※管理工数は、システムを使用せず必要時のみ電源管理を"
                     "行う場合に発生する、測定時刻・電源ON/OFF時刻・"
                     "3台の予定重複・申し送りの確認工数を、"
-                    f"1JOB当たり {manual_minutes_per_job:.1f} 分として"
+                    f"1Lot当たり {manual_minutes_per_job:.1f} 分として"
                     "換算した回避効果です。"
                 )
 
@@ -1642,9 +1643,9 @@ with st.expander(
             with st.expander("🧮 管理工数・労務費の計算内訳", expanded=False):
                 if labor_enabled:
                     st.code(
-                        f"対象JOB数：{managed_job_count} JOB\n"
+                        f"対象Lot数：{managed_job_count} Lot\n"
                         f"システムなし："
-                        f"{managed_job_count} JOB × "
+                        f"{managed_job_count} Lot × "
                         f"{manual_minutes_per_job:.1f}分 ÷ 60分 × "
                         f"{labor_hourly_rate:,}円/h"
                         f" ＝ {int(old_labor):,}円\n"
