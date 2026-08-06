@@ -1,3 +1,4 @@
+# Version 1.4.4: 通知音をクリスタルライズへ変更
 # Version 1.4.3: アプリ画面のLot表記統一
 # Version 1.4.2: EcoNavi金額ラベル固定サイズ対応（小額でも18px表示）
 # Version 1.4.1: EcoNaviデフォルト値（電気25円、修繕費0円、周期0時間）
@@ -111,46 +112,74 @@ WINDOWS_NOTIFICATION_REPEAT_MS = 30_000
 
 
 def _build_chime_wav() -> bytes:
-    """柔らかいベル音を4音鳴らし、少し間を空けて繰り返すチャイムを生成する。"""
-    sample_rate = 44_100
-    peak_amplitude = 19_000
+    """
+    クリスタルライズ通知音をプログラム内で生成する。
 
-    # 一般的なチャイムらしい4音。最後に無音を入れ、ループ時にも慌ただしくならないようにする。
-    notes = [
-        (784.00, 0.42),   # G5
-        (659.25, 0.42),   # E5
-        (698.46, 0.42),   # F5
-        (523.25, 0.72),   # C5
-        (0.00, 0.90),
+    同じフォルダーに alert_chime.wav がある場合は外部ファイルを優先し、
+    ファイルがない場合でも、明るく高級感のある上昇チャイムを生成する。
+    """
+    sample_rate = 44_100
+    duration_seconds = 3.6
+    frame_count = int(sample_rate * duration_seconds)
+
+    # C5 → E5 → G5 → C6へ上昇し、最後に高音のきらめきを加える。
+    tone_events = [
+        # 開始秒, 周波数, 長さ, 音量, 明るさ
+        (0.00, 523.25, 1.15, 0.52, 1.25),   # C5
+        (0.20, 659.25, 1.15, 0.56, 1.25),   # E5
+        (0.40, 783.99, 1.15, 0.60, 1.25),   # G5
+        (0.65, 1046.50, 1.15, 0.66, 1.25),  # C6
+        (0.88, 1567.98, 0.55, 0.20, 1.40),  # G6 sparkle
     ]
 
+    mixed = [0.0] * frame_count
+
+    for start_seconds, frequency, tone_duration, volume, brightness in tone_events:
+        start_frame = int(start_seconds * sample_rate)
+        tone_frames = int(tone_duration * sample_rate)
+
+        for i in range(tone_frames):
+            output_index = start_frame + i
+            if output_index >= frame_count:
+                break
+
+            t = i / sample_rate
+
+            # 最初は素早く立ち上がり、ベルのように自然に減衰する。
+            attack = min(1.0, t / 0.008)
+            base_decay = math.exp(-3.45 * t / max(tone_duration, 0.05))
+
+            # 基音と複数の倍音を混ぜ、透明感のあるベル音にする。
+            raw = (
+                1.00
+                * math.sin(2 * math.pi * frequency * t)
+                * base_decay
+                + 0.36
+                * brightness
+                * math.sin(2 * math.pi * frequency * 2.01 * t)
+                * math.exp(-3.70 * t / max(tone_duration, 0.05))
+                + 0.18
+                * brightness
+                * math.sin(2 * math.pi * frequency * 3.97 * t)
+                * math.exp(-4.20 * t / max(tone_duration, 0.05))
+                + 0.08
+                * brightness
+                * math.sin(2 * math.pi * frequency * 6.10 * t)
+                * math.exp(-4.75 * t / max(tone_duration, 0.05))
+            )
+
+            mixed[output_index] += raw * attack * volume
+
+    # 複数音を重ねても音割れしないよう、全体を正規化する。
+    max_level = max((abs(value) for value in mixed), default=1.0)
+    peak_amplitude = 28_000
+    scale = peak_amplitude / max(max_level, 1e-9)
+
     frames = bytearray()
-
-    for frequency, duration in notes:
-        frame_count = int(sample_rate * duration)
-
-        for i in range(frame_count):
-            if frequency == 0:
-                sample = 0
-            else:
-                t = i / sample_rate
-
-                # ベルのように最初だけ強く、その後ゆっくり減衰させる。
-                attack = min(1.0, t / 0.012)
-                decay = math.exp(-4.2 * t / max(duration, 0.01))
-                envelope = attack * decay
-
-                # 基音に複数の倍音を加え、単純な電子音ではなくチャイムに近づける。
-                raw = (
-                    1.00 * math.sin(2 * math.pi * frequency * t)
-                    + 0.42 * math.sin(2 * math.pi * frequency * 2.01 * t)
-                    + 0.20 * math.sin(2 * math.pi * frequency * 3.97 * t)
-                )
-
-                sample = int(peak_amplitude * raw * envelope)
-                sample = max(-32_768, min(32_767, sample))
-
-            frames.extend(struct.pack("<h", sample))
+    for value in mixed:
+        sample = int(value * scale)
+        sample = max(-32_768, min(32_767, sample))
+        frames.extend(struct.pack("<h", sample))
 
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav_file:
