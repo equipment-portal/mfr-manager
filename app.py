@@ -203,7 +203,7 @@ def render_monitor_activation():
           status.textContent = permission === "granted"
             ? "✅ チャイム音とWindows通知は有効です。"
             : "✅ チャイム音は有効です。Windows通知は未許可または利用できません。";
-          button.textContent = "🔊 もう一度、チャイム音とWindows通知をテスト";
+          button.textContent = "🔊 起動時に必ず押してください、チャイム音とWindows通知をテスト";
           button.style.background = "#15803d";
         }}
       }}
