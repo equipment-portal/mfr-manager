@@ -1,3 +1,5 @@
+# Version 1.4.2: EcoNavi金額ラベル固定サイズ対応（小額でも18px表示）
+# Version 1.4.1: EcoNaviデフォルト値（電気25円、修繕費0円、周期0時間）
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -1188,28 +1190,28 @@ with st.expander(
         elec_price = st.number_input(
             "電気代単価 (円/kWh)",
             min_value=0.0,
-            value=20.00,
+            value=25.00,
             step=1.00,
             format="%.2f",
-            help="20～25円目安",
+            help="暫定単価25円/kWh",
         )
 
     with col_h:
         heater_cost = st.number_input(
             "修繕・メンテナンス費用 (円)",
             min_value=0,
-            value=150000,
+            value=0,
             step=10000,
-            help="設備費を計算しない場合は0にしてください。",
+            help="初期値は0円です。設備費を計算する場合のみ入力してください。",
         )
 
     with col_l:
         heater_life_hours = st.number_input(
             "メンテナンス周期 (時間)",
             min_value=0,
-            value=10000,
+            value=0,
             step=1000,
-            help="設備費を計算しない場合は0にしてください。",
+            help="初期値は0時間です。設備費を計算する場合のみ入力してください。",
         )
 
     # 2段目：管理工数・労務費の条件
@@ -1523,10 +1525,16 @@ with st.expander(
                 },
             )
 
+            # 金額が小さい区分でも文字を縮小せず、常に同じ大きさで表示する。
+            # 棒の中に収まらない場合は自動的に外側へ移動する。
             fig_eco.update_traces(
                 texttemplate="<b>%{text:,.0f} 円</b>",
-                textposition="inside",
+                textposition="auto",
+                textangle=0,
                 insidetextfont=dict(size=18, color="white"),
+                outsidetextfont=dict(size=18, color="#111111"),
+                constraintext="none",
+                cliponaxis=False,
             )
 
             # 全費用が0でもPlotlyで0除算しないよう、最低1円幅を確保する。
@@ -1534,6 +1542,8 @@ with st.expander(
 
             fig_eco.update_layout(
                 barmode="stack",
+                # Plotlyの自動縮小を無効化し、すべての金額ラベルを18pxで統一する。
+                uniformtext=dict(minsize=18, mode="show"),
                 height=590,
                 title=dict(text=chart_title, font=dict(size=22)),
                 xaxis_title="",
