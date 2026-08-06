@@ -1,3 +1,4 @@
+# Version 1.4.5: 通知音キャッシュ・参照先・ブラウザーAudioを修正
 # Version 1.4.4: 通知音をクリスタルライズへ変更
 # Version 1.4.3: アプリ画面のLot表記統一
 # Version 1.4.2: EcoNavi金額ラベル固定サイズ対応（小額でも18px表示）
@@ -102,9 +103,15 @@ def get_image_base64(path):
         return base64.b64encode(image_file.read()).decode()
 
 # --- Chrome通知・チャイム音 ---
-# 同じフォルダーに alert_chime.wav があればそれを優先し、
-# ない場合も同じチャイム音をプログラム内で自動生成します。
-ALERT_SOUND_FILE = "alert_chime.wav"
+# 通知音は必ずこのプログラムと同じフォルダーから読み込みます。
+# 旧版の alert_chime.wav を誤って読み込まないよう、固有名を使用します。
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ALERT_SOUND_FILE = os.path.join(
+    SCRIPT_DIR,
+    "alert_crystal_rise.wav",
+)
+ALERT_SOUND_NAME = "クリスタルライズ"
+ALERT_SOUND_VERSION = "crystal_rise_1_4_5"
 
 # 未確認中のWindows通知を再表示する間隔。
 # Excelを前面で使用していても気づきやすいよう、30秒ごとに再通知します。
@@ -191,21 +198,54 @@ def _build_chime_wav() -> bytes:
     return buffer.getvalue()
 
 
+def get_alert_sound_file_mtime_ns() -> int:
+    """通知音ファイルの更新時刻を返し、差し替え時にキャッシュを更新する。"""
+    try:
+        return os.stat(ALERT_SOUND_FILE).st_mtime_ns
+    except OSError:
+        return 0
+
+
 @st.cache_data(show_spinner=False)
-def get_alert_sound_data_url():
+def get_alert_sound_data_url(
+    sound_version: str,
+    sound_file_mtime_ns: int,
+):
+    """
+    通知音をData URLへ変換する。
+
+    sound_versionと更新時刻をキャッシュキーに含めることで、
+    コード更新後も旧通知音が残る問題を防止する。
+    """
+    # 引数はキャッシュ更新に使用する。
+    _ = sound_version, sound_file_mtime_ns
+
     if os.path.exists(ALERT_SOUND_FILE):
-        mime_type = mimetypes.guess_type(ALERT_SOUND_FILE)[0] or "audio/wav"
-        with open(ALERT_SOUND_FILE, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("ascii")
+        mime_type = (
+            mimetypes.guess_type(ALERT_SOUND_FILE)[0]
+            or "audio/wav"
+        )
+        with open(ALERT_SOUND_FILE, "rb") as sound_file:
+            encoded = base64.b64encode(sound_file.read()).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
 
     encoded = base64.b64encode(_build_chime_wav()).decode("ascii")
     return f"data:audio/wav;base64,{encoded}"
 
 
+def get_current_alert_sound_data_url():
+    """常に現在の音色バージョンとファイル更新時刻で音声を取得する。"""
+    return get_alert_sound_data_url(
+        ALERT_SOUND_VERSION,
+        get_alert_sound_file_mtime_ns(),
+    )
+
+
 def render_monitor_activation():
     """始業時に直接クリックして、Chromeの音声再生とWindows通知権限を有効にする。"""
-    sound_url = json.dumps(get_alert_sound_data_url())
+    sound_url = json.dumps(get_current_alert_sound_data_url())
+    sound_name_js = json.dumps(ALERT_SOUND_NAME, ensure_ascii=False)
+    sound_version_js = json.dumps(ALERT_SOUND_VERSION)
     html = f"""
     <div style="font-family:Meiryo,sans-serif;border:2px solid #2563eb;border-radius:10px;
                 padding:12px;background:#eff6ff;">
@@ -223,6 +263,8 @@ def render_monitor_activation():
       const button = document.getElementById("mfr-enable");
       const status = document.getElementById("mfr-status");
       const soundUrl = {sound_url};
+      const soundName = {sound_name_js};
+      const soundVersion = {sound_version_js};
 
       function updateStatus() {{
         const enabled = parentWindow.localStorage.getItem("mfr_monitor_enabled") === "1";
@@ -296,7 +338,8 @@ def render_monitor_activation():
 
 def start_browser_alarm(alert_id, title, body):
     """未確認の通知がある間、チャイムをループしWindows通知を30秒ごとに再表示する。"""
-    sound_url = json.dumps(get_alert_sound_data_url())
+    sound_url = json.dumps(get_current_alert_sound_data_url())
+    sound_version_js = json.dumps(ALERT_SOUND_VERSION)
     alert_id_js = json.dumps(alert_id, ensure_ascii=False)
     title_js = json.dumps(title, ensure_ascii=False)
     body_js = json.dumps(body, ensure_ascii=False)
@@ -310,13 +353,18 @@ def start_browser_alarm(alert_id, title, body):
       const title = {title_js};
       const body = {body_js};
       const soundUrl = {sound_url};
+      const soundVersion = {sound_version_js};
       const repeatMs = {repeat_ms_js};
       const enabled = parentWindow.localStorage.getItem("mfr_monitor_enabled") === "1";
 
       if (!enabled) return;
 
       // 未確認の間、チャイム音を繰り返す。
-      if (!parentWindow.__mfrAlarmAudio || parentWindow.__mfrAlarmId !== alertId) {{
+      if (
+        !parentWindow.__mfrAlarmAudio
+        || parentWindow.__mfrAlarmId !== alertId
+        || parentWindow.__mfrAlarmSoundVersion !== soundVersion
+      ) {{
         if (parentWindow.__mfrAlarmAudio) {{
           parentWindow.__mfrAlarmAudio.pause();
           parentWindow.__mfrAlarmAudio.currentTime = 0;
@@ -327,6 +375,7 @@ def start_browser_alarm(alert_id, title, body):
         audio.volume = 1.0;
         parentWindow.__mfrAlarmAudio = audio;
         parentWindow.__mfrAlarmId = alertId;
+        parentWindow.__mfrAlarmSoundVersion = soundVersion;
 
         audio.play().catch(() => {{
           parentWindow.localStorage.setItem("mfr_audio_blocked", "1");
@@ -769,6 +818,10 @@ except:
 st.write(f"現在時刻: **{now.strftime('%Y/%m/%d %H:%M:%S')}** (10秒ごとに自動更新中 🔄)")
 
 st.subheader("🔔 Chrome通知・警告音")
+st.caption(
+    f"現在の通知音：{ALERT_SOUND_NAME} "
+    f"（音色バージョン：{ALERT_SOUND_VERSION}）"
+)
 render_monitor_activation()
 
 if active_alerts:
