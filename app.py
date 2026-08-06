@@ -1,3 +1,4 @@
+# Version 1.4.6: 通知音診断とブラウザー再生処理を強化
 # Version 1.4.5: 通知音キャッシュ・参照先・ブラウザーAudioを修正
 # Version 1.4.4: 通知音をクリスタルライズへ変更
 # Version 1.4.3: アプリ画面のLot表記統一
@@ -16,6 +17,7 @@ import urllib.request
 import io
 import math
 import mimetypes
+import hashlib
 import struct
 import wave
 from streamlit_autorefresh import st_autorefresh
@@ -241,103 +243,145 @@ def get_current_alert_sound_data_url():
     )
 
 
+def get_alert_sound_diagnostics():
+    """現在使用する通知音の読み込み情報を返す。"""
+    if os.path.exists(ALERT_SOUND_FILE):
+        with open(ALERT_SOUND_FILE, "rb") as sound_file:
+            sound_bytes = sound_file.read()
+        source_name = os.path.basename(ALERT_SOUND_FILE)
+        source_type = "外部WAVファイル"
+    else:
+        sound_bytes = _build_chime_wav()
+        source_name = "プログラム内生成音"
+        source_type = "内部生成"
+
+    return {
+        "bytes": sound_bytes,
+        "name": source_name,
+        "type": source_type,
+        "size": len(sound_bytes),
+        "hash": hashlib.sha256(sound_bytes).hexdigest(),
+    }
+
+
 def render_monitor_activation():
-    """始業時に直接クリックして、Chromeの音声再生とWindows通知権限を有効にする。"""
+    """
+    始業時にクリックして、音声再生とWindows通知権限を有効にする。
+
+    テスト音はクリックされた同じiframe内のaudio要素から再生する。
+    """
     sound_url = json.dumps(get_current_alert_sound_data_url())
     sound_name_js = json.dumps(ALERT_SOUND_NAME, ensure_ascii=False)
     sound_version_js = json.dumps(ALERT_SOUND_VERSION)
+
     html = f"""
-    <div style="font-family:Meiryo,sans-serif;border:2px solid #2563eb;border-radius:10px;
-                padding:12px;background:#eff6ff;">
-      <button id="mfr-enable" style="width:100%;padding:12px;font-size:17px;font-weight:bold;
-              color:white;background:#1d4ed8;border:0;border-radius:8px;cursor:pointer;">
-        🔔 監視開始・Windows通知を許可・チャイムをテスト
+    <div style="font-family:Meiryo,sans-serif;border:2px solid #2563eb;
+                border-radius:10px;padding:12px;background:#eff6ff;">
+      <button id="mfr-enable" style="width:100%;padding:12px;font-size:17px;
+              font-weight:bold;color:white;background:#1d4ed8;border:0;
+              border-radius:8px;cursor:pointer;">
+        🔔 監視開始・Windows通知を許可・通知音をテスト
       </button>
-      <div id="mfr-status" style="margin-top:8px;font-size:14px;font-weight:bold;color:#1f2937;">
+
+      <div id="mfr-status" style="margin-top:8px;font-size:14px;
+              font-weight:bold;color:#1f2937;white-space:pre-wrap;">
         シフト開始時に上のボタンを1回押してください。
       </div>
+
+      <audio id="mfr-test-audio" preload="auto" src={sound_url}></audio>
     </div>
+
     <script>
     (() => {{
       const parentWindow = window.parent;
       const button = document.getElementById("mfr-enable");
       const status = document.getElementById("mfr-status");
-      const soundUrl = {sound_url};
+      const testAudio = document.getElementById("mfr-test-audio");
       const soundName = {sound_name_js};
       const soundVersion = {sound_version_js};
 
-      function updateStatus() {{
-        const enabled = parentWindow.localStorage.getItem("mfr_monitor_enabled") === "1";
-        const permission = ("Notification" in parentWindow)
-          ? parentWindow.Notification.permission : "unsupported";
-
-        if (enabled) {{
-          status.textContent = permission === "granted"
-            ? "✅ チャイム音とWindows通知は有効です。"
-            : "✅ チャイム音は有効です。Windows通知は未許可または利用できません。";
-          button.textContent = "🔊 起動時に必ず押してください、チャイム音とWindows通知をテスト";
-          button.style.background = "#15803d";
-        }}
+      function setStatus(message) {{
+        status.textContent = message;
       }}
 
       button.addEventListener("click", async () => {{
-        parentWindow.localStorage.setItem("mfr_monitor_enabled", "1");
-
-        // 以前の通知記録を消し、テスト後の本番通知が確実に出るようにする。
-        for (let i = parentWindow.localStorage.length - 1; i >= 0; i--) {{
-          const key = parentWindow.localStorage.key(i);
-          if (key && (
-              key.startsWith("mfr_notified_")
-              || key.startsWith("mfr_notify_time_")
-          )) {{
-            parentWindow.localStorage.removeItem(key);
-          }}
-        }}
-
-        let permission = "unsupported";
         try {{
+          parentWindow.localStorage.setItem("mfr_monitor_enabled", "1");
+          parentWindow.localStorage.setItem(
+            "mfr_alert_sound_version",
+            soundVersion
+          );
+
+          let permission = "unsupported";
           if ("Notification" in parentWindow) {{
             permission = parentWindow.Notification.permission;
             if (permission === "default") {{
-              permission = await parentWindow.Notification.requestPermission();
+              permission =
+                await parentWindow.Notification.requestPermission();
             }}
           }}
 
-          const testAudio = new parentWindow.Audio(soundUrl);
+          testAudio.pause();
+          testAudio.currentTime = 0;
+          testAudio.muted = false;
           testAudio.volume = 1.0;
           await testAudio.play();
+
           parentWindow.setTimeout(() => {{
             testAudio.pause();
             testAudio.currentTime = 0;
-          }}, 3200);
+          }}, 3500);
 
           if (permission === "granted") {{
-            const testNotification = new parentWindow.Notification("MFR通知テスト", {{
-              body: "チャイム音とWindows通知の準備が完了しました。",
-              tag: "mfr-notification-test",
-              requireInteraction: true
-            }});
-            testNotification.onclick = () => {{
+            const notification =
+              new parentWindow.Notification("MFR通知テスト", {{
+                body:
+                  `通知音「${{soundName}}」とWindows通知の準備が完了しました。`,
+                tag: "mfr-notification-test",
+                requireInteraction: true
+              }});
+
+            notification.onclick = () => {{
               parentWindow.focus();
-              testNotification.close();
+              notification.close();
             }};
           }}
 
-          updateStatus();
+          setStatus(
+            `✅ 通知音「${{soundName}}」を再生しました。\\n`
+            + `音色バージョン：${{soundVersion}}`
+          );
+          button.textContent =
+            `🔊 通知音「${{soundName}}」をもう一度テスト`;
+          button.style.background = "#15803d";
+
         }} catch (error) {{
-          status.textContent = "⚠️ 音声がブロックされました。Chromeのサイト設定で音声を許可してください。";
+          const errorName = error?.name || "UnknownError";
+          const errorMessage = error?.message || String(error);
+
+          setStatus(
+            "⚠️ 通知音を再生できませんでした。\\n"
+            + `エラー：${{errorName}}\\n`
+            + `${{errorMessage}}\\n`
+            + "Chromeのタブミュート、サイトの音声設定、"
+            + "Windows音量を確認してください。"
+          );
+          button.style.background = "#b91c1c";
         }}
       }});
-
-      updateStatus();
     }})();
     </script>
     """
-    components.html(html, height=125, scrolling=False)
+
+    components.html(html, height=165, scrolling=False)
+
 
 
 def start_browser_alarm(alert_id, title, body):
-    """未確認の通知がある間、チャイムをループしWindows通知を30秒ごとに再表示する。"""
+    """
+    未確認通知がある間、通知音をループし、
+    Windows通知を30秒ごとに再表示する。
+    """
     sound_url = json.dumps(get_current_alert_sound_data_url())
     sound_version_js = json.dumps(ALERT_SOUND_VERSION)
     alert_id_js = json.dumps(alert_id, ensure_ascii=False)
@@ -355,34 +399,51 @@ def start_browser_alarm(alert_id, title, body):
       const soundUrl = {sound_url};
       const soundVersion = {sound_version_js};
       const repeatMs = {repeat_ms_js};
-      const enabled = parentWindow.localStorage.getItem("mfr_monitor_enabled") === "1";
+
+      const enabled =
+        parentWindow.localStorage.getItem("mfr_monitor_enabled") === "1";
 
       if (!enabled) return;
 
-      // 未確認の間、チャイム音を繰り返す。
-      if (
-        !parentWindow.__mfrAlarmAudio
-        || parentWindow.__mfrAlarmId !== alertId
-        || parentWindow.__mfrAlarmSoundVersion !== soundVersion
-      ) {{
-        if (parentWindow.__mfrAlarmAudio) {{
-          parentWindow.__mfrAlarmAudio.pause();
-          parentWindow.__mfrAlarmAudio.currentTime = 0;
-        }}
+      let audio =
+        parentWindow.document.getElementById("mfr-global-alarm-audio");
 
-        const audio = new parentWindow.Audio(soundUrl);
+      if (!audio) {{
+        audio = parentWindow.document.createElement("audio");
+        audio.id = "mfr-global-alarm-audio";
+        audio.style.display = "none";
+        audio.preload = "auto";
+        parentWindow.document.body.appendChild(audio);
+      }}
+
+      const needsReplacement =
+        audio.dataset.alertId !== alertId
+        || audio.dataset.soundVersion !== soundVersion;
+
+      if (needsReplacement) {{
+        audio.pause();
+        audio.currentTime = 0;
+        audio.src = soundUrl;
+        audio.dataset.alertId = alertId;
+        audio.dataset.soundVersion = soundVersion;
         audio.loop = true;
+        audio.muted = false;
         audio.volume = 1.0;
-        parentWindow.__mfrAlarmAudio = audio;
-        parentWindow.__mfrAlarmId = alertId;
-        parentWindow.__mfrAlarmSoundVersion = soundVersion;
+        audio.load();
+      }}
 
-        audio.play().catch(() => {{
-          parentWindow.localStorage.setItem("mfr_audio_blocked", "1");
+      if (audio.paused) {{
+        audio.play().then(() => {{
+          parentWindow.localStorage.removeItem("mfr_audio_error");
+        }}).catch((error) => {{
+          parentWindow.localStorage.setItem(
+            "mfr_audio_error",
+            `${{error?.name || "UnknownError"}}: `
+            + `${{error?.message || String(error)}}`
+          );
         }});
       }}
 
-      // Excelが前面でも気づけるよう、未確認中は一定間隔でWindows通知を再表示する。
       const notifyTimeKey = "mfr_notify_time_" + alertId;
       const lastNotifyTime = Number(
         parentWindow.localStorage.getItem(notifyTimeKey) || "0"
@@ -414,12 +475,17 @@ def start_browser_alarm(alert_id, title, body):
         }};
 
         parentWindow.__mfrNotification = notification;
-        parentWindow.localStorage.setItem(notifyTimeKey, String(currentTime));
+        parentWindow.localStorage.setItem(
+          notifyTimeKey,
+          String(currentTime)
+        );
       }}
     }})();
     </script>
     """
+
     components.html(html, height=0, width=0)
+
 
 
 def stop_browser_alarm():
@@ -427,12 +493,15 @@ def stop_browser_alarm():
     <script>
     (() => {
       const parentWindow = window.parent;
+      const audio =
+        parentWindow.document.getElementById("mfr-global-alarm-audio");
 
-      if (parentWindow.__mfrAlarmAudio) {
-        parentWindow.__mfrAlarmAudio.pause();
-        parentWindow.__mfrAlarmAudio.currentTime = 0;
-        parentWindow.__mfrAlarmAudio = null;
-        parentWindow.__mfrAlarmId = null;
+      if (audio) {
+        audio.pause();
+        audio.currentTime = 0;
+        audio.removeAttribute("src");
+        audio.load();
+        audio.remove();
       }
 
       if (parentWindow.__mfrNotification) {
@@ -444,7 +513,9 @@ def stop_browser_alarm():
     })();
     </script>
     """
+
     components.html(html, height=0, width=0)
+
 
 
 def get_measurement_text(num_targets, current_target_qty, targets):
@@ -818,11 +889,29 @@ except:
 st.write(f"現在時刻: **{now.strftime('%Y/%m/%d %H:%M:%S')}** (10秒ごとに自動更新中 🔄)")
 
 st.subheader("🔔 Chrome通知・警告音")
+
+sound_diagnostics = get_alert_sound_diagnostics()
+
 st.caption(
     f"現在の通知音：{ALERT_SOUND_NAME} "
-    f"（音色バージョン：{ALERT_SOUND_VERSION}）"
+    f"（{sound_diagnostics['type']}／"
+    f"{sound_diagnostics['name']}／"
+    f"{sound_diagnostics['size']:,} byte／"
+    f"識別番号 {sound_diagnostics['hash'][:12]}）"
 )
+
 render_monitor_activation()
+
+with st.expander("🔍 通知音ファイルの診断・手動試聴", expanded=False):
+    st.write(f"読み込み元：**{sound_diagnostics['name']}**")
+    st.write(f"ファイル容量：**{sound_diagnostics['size']:,} byte**")
+    st.write(f"SHA-256：`{sound_diagnostics['hash']}`")
+    st.audio(sound_diagnostics["bytes"], format="audio/wav")
+    st.caption(
+        "この標準プレーヤーでも音が出ない場合は、"
+        "Chromeのタブミュート、サイトの音声設定、"
+        "Windows音量設定を確認してください。"
+    )
 
 if active_alerts:
     primary_alert = active_alerts[0]
