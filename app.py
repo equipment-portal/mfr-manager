@@ -1,3 +1,4 @@
+# Version 1.4.9: 確認ボタン押下まで通知音を確実に繰り返す
 # Version 1.4.8: 通知欄の詳細表示を非表示・ボタン文言を固定
 # Version 1.4.7: 通知音をWeb Audio API直接生成方式へ変更
 # Version 1.4.6: 通知音診断とブラウザー再生処理を強化
@@ -469,6 +470,9 @@ def render_monitor_activation():
             }}
           }}
 
+          parentWindow.__mfrCrystalRiseLastPlayAt =
+            Date.now();
+
           return audioContext.state;
         }};
 
@@ -480,35 +484,124 @@ def render_monitor_activation():
             parentWindow.__mfrCrystalRiseTimer = null;
           }}
 
+          if (parentWindow.__mfrCrystalRiseWatchdog) {{
+            parentWindow.clearInterval(
+              parentWindow.__mfrCrystalRiseWatchdog
+            );
+            parentWindow.__mfrCrystalRiseWatchdog = null;
+          }}
+
           parentWindow.__mfrCrystalRiseAlertId = null;
+          parentWindow.__mfrCrystalRiseLastPlayAt = 0;
+
+          parentWindow.localStorage.removeItem(
+            "mfr_active_alert_id"
+          );
+          parentWindow.localStorage.removeItem(
+            "mfr_alarm_loop_enabled"
+          );
+
           parentWindow.__mfrStopActiveCrystalSources();
         }};
 
         parentWindow.__mfrStartCrystalRiseLoop =
           async function(alertId) {{
+            const storedAlertId =
+              parentWindow.localStorage.getItem(
+                "mfr_active_alert_id"
+              );
+
             if (
               parentWindow.__mfrCrystalRiseTimer
               && parentWindow.__mfrCrystalRiseAlertId === alertId
+              && storedAlertId === alertId
             ) {{
               return;
             }}
 
             parentWindow.__mfrStopCrystalRiseLoop();
+
             parentWindow.__mfrCrystalRiseAlertId = alertId;
+            parentWindow.localStorage.setItem(
+              "mfr_active_alert_id",
+              alertId
+            );
+            parentWindow.localStorage.setItem(
+              "mfr_alarm_loop_enabled",
+              "1"
+            );
 
-            await parentWindow.__mfrPlayCrystalRiseOnce();
+            const playIfStillActive = async () => {{
+              const activeAlertId =
+                parentWindow.localStorage.getItem(
+                  "mfr_active_alert_id"
+                );
+              const loopEnabled =
+                parentWindow.localStorage.getItem(
+                  "mfr_alarm_loop_enabled"
+                ) === "1";
 
+              if (
+                !loopEnabled
+                || activeAlertId !== alertId
+                || parentWindow.__mfrCrystalRiseAlertId !== alertId
+              ) {{
+                parentWindow.__mfrStopCrystalRiseLoop();
+                return;
+              }}
+
+              try {{
+                await parentWindow.__mfrPlayCrystalRiseOnce();
+                parentWindow.localStorage.removeItem(
+                  "mfr_audio_error"
+                );
+              }} catch (error) {{
+                parentWindow.localStorage.setItem(
+                  "mfr_audio_error",
+                  `${{error?.name || "AudioError"}}: `
+                  + `${{error?.message || String(error)}}`
+                );
+              }}
+            }};
+
+            // 警告発生時に直ちに1回鳴らす。
+            await playIfStillActive();
+
+            // 通常の繰り返し再生。確認されるまで約4.2秒間隔で鳴らす。
             parentWindow.__mfrCrystalRiseTimer =
+              parentWindow.setInterval(
+                playIfStillActive,
+                4200
+              );
+
+            // 自動更新等で通常タイマーが途切れても、
+            // 最終再生から4.8秒以上経過したら再生を復旧する。
+            parentWindow.__mfrCrystalRiseWatchdog =
               parentWindow.setInterval(() => {{
-                parentWindow.__mfrPlayCrystalRiseOnce()
-                  .catch((error) => {{
-                    parentWindow.localStorage.setItem(
-                      "mfr_audio_error",
-                      `${{error?.name || "AudioError"}}: `
-                      + `${{error?.message || String(error)}}`
-                    );
-                  }});
-              }}, 4200);
+                const activeAlertId =
+                  parentWindow.localStorage.getItem(
+                    "mfr_active_alert_id"
+                  );
+                const loopEnabled =
+                  parentWindow.localStorage.getItem(
+                    "mfr_alarm_loop_enabled"
+                  ) === "1";
+                const elapsed =
+                  Date.now()
+                  - (
+                    parentWindow.__mfrCrystalRiseLastPlayAt
+                    || 0
+                  );
+
+                if (
+                  loopEnabled
+                  && activeAlertId === alertId
+                  && parentWindow.__mfrCrystalRiseAlertId === alertId
+                  && elapsed >= 4800
+                ) {{
+                  playIfStillActive();
+                }}
+              }}, 1000);
           }};
       }}
 
@@ -623,6 +716,15 @@ def start_browser_alarm(alert_id, title, body):
 
       if (!enabled) return;
 
+      parentWindow.localStorage.setItem(
+        "mfr_active_alert_id",
+        alertId
+      );
+      parentWindow.localStorage.setItem(
+        "mfr_alarm_loop_enabled",
+        "1"
+      );
+
       if (
         typeof parentWindow.__mfrStartCrystalRiseLoop
         === "function"
@@ -709,6 +811,13 @@ def stop_browser_alarm():
     <script>
     (() => {
       const parentWindow = window.parent;
+
+      parentWindow.localStorage.removeItem(
+        "mfr_active_alert_id"
+      );
+      parentWindow.localStorage.removeItem(
+        "mfr_alarm_loop_enabled"
+      );
 
       if (
         typeof parentWindow.__mfrStopCrystalRiseLoop
@@ -1154,7 +1263,7 @@ if active_alerts:
     )
 
     if st.button(
-        "✅ 確認しました（警告音を停止）",
+        "✅ 確認しました（通知音を停止）",
         key=f"ack_{primary_alert['id']}",
         type="primary",
     ):
