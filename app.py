@@ -1,3 +1,4 @@
+# Version 1.4.8: 通知欄の詳細表示を非表示・ボタン文言を固定
 # Version 1.4.7: 通知音をWeb Audio API直接生成方式へ変更
 # Version 1.4.6: 通知音診断とブラウザー再生処理を強化
 # Version 1.4.5: 通知音キャッシュ・参照先・ブラウザーAudioを修正
@@ -281,13 +282,12 @@ def render_monitor_activation():
       <button id="mfr-enable" style="width:100%;padding:12px;font-size:17px;
               font-weight:bold;color:white;background:#1d4ed8;border:0;
               border-radius:8px;cursor:pointer;">
-        🔔 監視開始・Windows通知を許可・通知音をテスト
+        起動時に必ず押してください。監視開始、チャイム音・Windows通知テスト
       </button>
 
-      <div id="mfr-status" style="margin-top:8px;font-size:14px;
-              font-weight:bold;color:#1f2937;white-space:pre-wrap;">
-        シフト開始時に上のボタンを1回押してください。
-      </div>
+      <div id="mfr-status" style="display:none;margin-top:8px;
+              font-size:14px;font-weight:bold;color:#b91c1c;
+              white-space:pre-wrap;"></div>
     </div>
 
     <script>
@@ -298,8 +298,14 @@ def render_monitor_activation():
       const soundName = {sound_name_js};
       const soundVersion = {sound_version_js};
 
-      function setStatus(message) {{
+      function showErrorStatus(message) {{
         status.textContent = message;
+        status.style.display = "block";
+      }}
+
+      function hideStatus() {{
+        status.textContent = "";
+        status.style.display = "none";
       }}
 
       function installCrystalRiseEngine() {{
@@ -508,6 +514,7 @@ def render_monitor_activation():
 
       button.addEventListener("click", async () => {{
         try {{
+          hideStatus();
           installCrystalRiseEngine();
 
           parentWindow.localStorage.setItem(
@@ -535,8 +542,7 @@ def render_monitor_activation():
             }}
           }}
 
-          const contextState =
-            await parentWindow.__mfrPlayCrystalRiseOnce();
+          await parentWindow.__mfrPlayCrystalRiseOnce();
 
           if (permission === "granted") {{
             const notification =
@@ -557,15 +563,10 @@ def render_monitor_activation():
             }};
           }}
 
-          setStatus(
-            `✅ 通知音「${{soundName}}」を再生しました。\\n`
-            + "再生方式：Web Audio API（WAV不使用）\\n"
-            + `AudioContext：${{contextState}}\\n`
-            + `音色バージョン：${{soundVersion}}`
-          );
-
+          // 正常時は詳細情報を表示せず、ボタン文言を固定する。
+          hideStatus();
           button.textContent =
-            `🔊 通知音「${{soundName}}」をもう一度テスト`;
+            "起動時に必ず押してください。監視開始、チャイム音・Windows通知テスト";
           button.style.background = "#15803d";
 
         }} catch (error) {{
@@ -574,7 +575,7 @@ def render_monitor_activation():
           const errorMessage =
             error?.message || String(error);
 
-          setStatus(
+          showErrorStatus(
             "⚠️ 通知音を再生できませんでした。\\n"
             + `エラー：${{errorName}}\\n`
             + `${{errorMessage}}\\n`
@@ -592,7 +593,7 @@ def render_monitor_activation():
     </script>
     """
 
-    components.html(html, height=190, scrolling=False)
+    components.html(html, height=105, scrolling=False)
 
 
 
@@ -1118,11 +1119,6 @@ st.write(f"現在時刻: **{now.strftime('%Y/%m/%d %H:%M:%S')}** (10秒ごとに
 st.subheader("🔔 Chrome通知・警告音")
 
 sound_diagnostics = get_alert_sound_diagnostics()
-
-st.caption(
-    f"現在の通知音：{ALERT_SOUND_NAME} "
-    "（Web Audio APIによるブラウザー直接生成／WAV不使用）"
-)
 
 render_monitor_activation()
 
