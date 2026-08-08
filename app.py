@@ -1,3 +1,4 @@
+# Version 1.5.6: タイムライン黄色測定マークを加熱60分後の予定時刻へ統一
 # Version 1.5.5: アラート経過時間を時間・分表示、監視開始後のボタン文言を簡略化
 # Version 1.5.4: 初回MFR測定を加熱60分後へ修正・通知タイミング再確認
 # Version 1.5.3: 次回測定までの残り時間を時間・分表示へ変更
@@ -1136,6 +1137,39 @@ with st.sidebar:
 now = (datetime.utcnow() + timedelta(hours=9))
 today_date = now.date()
 
+def calculate_planned_measurement_time(job, target):
+    """
+    未完了のMFR測定予定時刻を一元計算する。
+
+    生産数・サイクルタイムから求めた時刻が早くても、
+    生産スタートから60分の加熱完了時刻より前にはしない。
+    通知、電源スケジュール、タイムラインの黄色◆で共通使用する。
+    """
+    if job is None or job.get('status') != 'Running':
+        return None
+
+    remaining_qty = target - job['current_qty']
+
+    if remaining_qty <= 0:
+        est_time = job['last_update']
+    else:
+        est_time = (
+            job['last_update']
+            + timedelta(
+                seconds=remaining_qty * job['cycle_time']
+            )
+        )
+
+    heat_ready_at = job.get('heat_ready_at')
+    if (
+        isinstance(heat_ready_at, datetime)
+        and est_time < heat_ready_at
+    ):
+        est_time = heat_ready_at
+
+    return est_time
+
+
 def calculate_upcoming_measurements():
     upcoming = []
     max_date = today_date 
@@ -1145,28 +1179,10 @@ def calculate_upcoming_measurements():
         for target in job['targets']:
             if target not in job['completed']:
                 if job['status'] == 'Running':
-                    remaining_qty = target - job['current_qty']
-
-                    if remaining_qty <= 0:
-                        est_time = job['last_update']
-                    else:
-                        est_time = (
-                            job['last_update']
-                            + timedelta(
-                                seconds=remaining_qty * job['cycle_time']
-                            )
-                        )
-
-                    # 生産スタート直後の「始」測定が1個目のサイクルで
-                    # すぐ到来しても、MFR加熱60分が終わるまでは
-                    # 測定予定時刻にしない。
-                    heat_ready_at = job.get('heat_ready_at')
-                    if (
-                        isinstance(heat_ready_at, datetime)
-                        and est_time < heat_ready_at
-                    ):
-                        est_time = heat_ready_at
-
+                    est_time = calculate_planned_measurement_time(
+                        job,
+                        target,
+                    )
                 elif job['status'] == 'Paused':
                     est_time = None 
                 
@@ -1634,8 +1650,43 @@ for machine, job in st.session_state.jobs.items():
     timeline_data.append({'Task': machine, 'Start': start_time, 'End': end_time, 'Status': job['status'], 'Targets': job['targets']})
 
     for t in job['targets']:
-        t_time = job['last_update'] if job['status'] != 'Running' or (t - job['current_qty']) <= 0 else job['last_update'] + timedelta(seconds=(t - job['current_qty']) * job['cycle_time'])
-        measurement_points.append({'Task': machine, 'Time': t_time, 'Target_Qty': t, 'Targets': job['targets'], 'Status': 'Completed' if (t in job['completed']) else 'Planned'})
+        is_completed = t in job['completed']
+
+        if is_completed:
+            # 完了済みマークは従来どおりの表示位置を維持する。
+            if (
+                job['status'] != 'Running'
+                or (t - job['current_qty']) <= 0
+            ):
+                t_time = job['last_update']
+            else:
+                t_time = (
+                    job['last_update']
+                    + timedelta(
+                        seconds=(
+                            (t - job['current_qty'])
+                            * job['cycle_time']
+                        )
+                    )
+                )
+            point_status = 'Completed'
+        else:
+            # 未完了の黄色◆は通知と完全に同じ測定予定時刻を使う。
+            t_time = calculate_planned_measurement_time(job, t)
+
+            # 一時停止中は測定予定時刻が確定しないので表示しない。
+            if t_time is None:
+                continue
+
+            point_status = 'Planned'
+
+        measurement_points.append({
+            'Task': machine,
+            'Time': t_time,
+            'Target_Qty': t,
+            'Targets': job['targets'],
+            'Status': point_status,
+        })
 
 today_start = datetime.combine(now.date(), dt_time.min)
 
