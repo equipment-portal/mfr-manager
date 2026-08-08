@@ -1,3 +1,4 @@
+# Version 1.6.8: 今後予定を「次の電源操作・次のMFR測定」に集約／電源OFF確認後に表示札記入確認ダイアログ
 # Version 1.6.7: 色弱でも判別しやすい配色へ全面調整（青=正常/完了、黄橙=要操作、赤=アラート、灰=停止）
 # Version 1.6.6: MFR測定ボタンを未測定=オレンジ・測定済み=緑へ色分けし、状態が明確な文言へ変更
 # Version 1.6.5: 始・中のMFR測定完了を再押下で取消可能・通知履歴と電源ONバーも復元
@@ -140,6 +141,10 @@ def save_state():
         # 最終MFR測定後の「生産も終了ですか？」確認待ち。
         'pending_production_finish_confirmation': st.session_state.get(
             'pending_production_finish_confirmation'
+        ),
+        # 電源OFF確認後の「次回ON予定を表示札へ記入」確認待ち。
+        'pending_signboard_confirmation': st.session_state.get(
+            'pending_signboard_confirmation'
         ),
         # 作業者が確認した実際のMFR電源状態。
         # ON確認後は、OFF確認されるまで再度ONアラートを出さない。
@@ -1083,6 +1088,52 @@ st.markdown(
         color: #334155;
     }
 
+    /* 現場向け：次に必要な操作だけを大きく表示するカード */
+    .next-action-card {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 12px;
+        padding: 1rem 1.1rem;
+        min-height: 150px;
+        margin: 0.15rem 0 0.55rem 0;
+    }
+    .next-action-label {
+        font-size: 1.0rem;
+        font-weight: 800;
+        margin-bottom: 0.35rem;
+    }
+    .next-action-main {
+        font-size: 2.05rem;
+        font-weight: 900;
+        line-height: 1.18;
+        margin-bottom: 0.35rem;
+    }
+    .next-action-sub {
+        font-size: 1.05rem;
+        font-weight: 700;
+        line-height: 1.4;
+    }
+    .next-action-yellow {
+        background: #fff7cc;
+        border: 3px solid #d97706;
+        color: #3f2a00;
+    }
+    .next-action-blue {
+        background: #e8f1ff;
+        border: 3px solid #2563eb;
+        color: #0b2f6b;
+    }
+    .next-action-red {
+        background: #fee2e2;
+        border: 3px solid #dc2626;
+        color: #7f1d1d;
+    }
+    .next-action-gray {
+        background: #f1f5f9;
+        border: 3px solid #94a3b8;
+        color: #334155;
+    }
+
     .mfr-active-alert {
         background: #b91c1c;
         color: white;
@@ -1191,6 +1242,9 @@ if 'initialized' not in st.session_state:
         st.session_state.pending_production_finish_confirmation = (
             saved_state.get('pending_production_finish_confirmation')
         )
+        st.session_state.pending_signboard_confirmation = (
+            saved_state.get('pending_signboard_confirmation')
+        )
 
         power_state_version = int(
             saved_state.get('mfr_power_state_version', 0)
@@ -1218,6 +1272,7 @@ if 'initialized' not in st.session_state:
         st.session_state.acknowledged_alerts = []
         st.session_state.pending_power_off_due = None
         st.session_state.pending_production_finish_confirmation = None
+        st.session_state.pending_signboard_confirmation = None
         st.session_state.mfr_power_is_on = False
         st.session_state.mfr_power_on_confirmed_at = None
         default_products = {
@@ -1274,6 +1329,8 @@ if 'pending_production_start' not in st.session_state:
     st.session_state.pending_production_start = None
 if 'pending_production_finish_confirmation' not in st.session_state:
     st.session_state.pending_production_finish_confirmation = None
+if 'pending_signboard_confirmation' not in st.session_state:
+    st.session_state.pending_signboard_confirmation = None
 
 # --- UI：サイドバー ---
 with st.sidebar:
@@ -1346,6 +1403,7 @@ with st.sidebar:
         st.session_state.mfr_power_on_confirmed_at = None
         st.session_state.pending_production_start = None
         st.session_state.pending_production_finish_confirmation = None
+        st.session_state.pending_signboard_confirmation = None
         save_state(); st.rerun()
         
     if st.button("🔄 今日の点検状態を未実施に戻す"):
@@ -1564,6 +1622,81 @@ if valid_upcoming:
         else:
             current_end = next_measure
     on_blocks.append((current_start, current_end + timedelta(minutes=10)))
+
+
+def format_next_action_time(dt_value, reference_time):
+    """次の作業時刻を「今日／明日／日付」で大きく読みやすく表示する。"""
+    if not isinstance(dt_value, datetime):
+        return "予定なし"
+
+    if dt_value.date() == reference_time.date():
+        return f"今日 {dt_value.strftime('%H:%M')}"
+    if dt_value.date() == reference_time.date() + timedelta(days=1):
+        return f"明日 {dt_value.strftime('%H:%M')}"
+    return dt_value.strftime('%m/%d %H:%M')
+
+
+def get_next_power_on_time(reference_time=None):
+    """現在時刻より後の、最も近いMFR電源ON予定時刻を返す。"""
+    if reference_time is None:
+        reference_time = datetime.utcnow() + timedelta(hours=9)
+
+    future_starts = [
+        block_start
+        for block_start, _ in on_blocks
+        if block_start > reference_time
+    ]
+    return min(future_starts) if future_starts else None
+
+
+def get_next_power_action(reference_time):
+    """作業者が次に行うMFR電源操作（ON/OFF）を1件だけ返す。"""
+    power_is_on = bool(st.session_state.get('mfr_power_is_on', False))
+
+    if power_is_on:
+        pending_off = st.session_state.get('pending_power_off_due')
+        if isinstance(pending_off, datetime) and pending_off >= reference_time:
+            return 'OFF', pending_off
+
+        current_or_next_ends = [
+            block_end
+            for block_start, block_end in on_blocks
+            if block_end >= reference_time
+            and block_start <= reference_time
+        ]
+        if current_or_next_ends:
+            return 'OFF', min(current_or_next_ends)
+
+        # PC上ではONだが現在のON区間が特定できない場合は、
+        # 次のON区間終了時刻を参考OFF予定として表示する。
+        future_ends = [
+            block_end
+            for block_start, block_end in on_blocks
+            if block_end >= reference_time
+        ]
+        if future_ends:
+            return 'OFF', min(future_ends)
+        return None, None
+
+    # 電源OFF中。現在すでにON予定時刻を過ぎている区間があれば「今すぐON」。
+    active_starts = [
+        block_start
+        for block_start, block_end in on_blocks
+        if block_start <= reference_time <= block_end
+    ]
+    if active_starts:
+        return 'ON', min(active_starts)
+
+    future_starts = [
+        block_start
+        for block_start, _ in on_blocks
+        if block_start > reference_time
+    ]
+    if future_starts:
+        return 'ON', min(future_starts)
+
+    return None, None
+
 
 # --- アラーム・ダイアログ通知 ---
 # 「表示しただけ」では消さず、作業者が［確認しました］を押すまで active_alerts に残します。
@@ -1810,6 +1943,15 @@ if active_alerts:
             st.session_state.mfr_power_on_confirmed_at = None
             st.session_state.pending_power_off_due = None
 
+            # OFF確認直後に、次回ON予定を表示札へ記入したか確認する。
+            next_on_time = get_next_power_on_time(
+                datetime.utcnow() + timedelta(hours=9)
+            )
+            st.session_state.pending_signboard_confirmation = {
+                'next_on_time': next_on_time,
+                'off_confirmed_at': datetime.utcnow() + timedelta(hours=9),
+            }
+
         save_state()
         stop_browser_alarm()
         st.rerun()
@@ -1847,40 +1989,6 @@ with status_col:
             unsafe_allow_html=True,
         )
 
-    if not valid_upcoming:
-        st.caption("次回の測定予定なし")
-    else:
-        next_measure = valid_upcoming[0]
-        time_diff = next_measure['est_time'] - now
-        minutes_until = time_diff.total_seconds() / 60
-
-        if next_measure['target_qty'] == '日常点検':
-            meas_text = '日常点検'
-        else:
-            meas_text = (
-                f"{get_measurement_text(len(next_measure['Targets']), next_measure['target_qty'], next_measure['Targets'])}測定"
-            )
-
-        remaining_time_text = format_remaining_time(minutes_until)
-        next_label = f"{next_measure['machine']}・{meas_text}"
-
-        if minutes_until <= 60:
-            if st.session_state.get('mfr_power_is_on', False):
-                st.caption(
-                    f"次回 {next_label} まで {remaining_time_text}"
-                )
-            else:
-                st.warning(
-                    f"次の操作：電源ON　{next_label}"
-                )
-        elif minutes_until >= 90:
-            st.caption(
-                f"次回 {next_label} まで {remaining_time_text}"
-            )
-        else:
-            minutes_to_on = max(0, int(minutes_until - 60))
-            on_wait_text = format_remaining_time(minutes_to_on)
-            st.warning(f"約 {on_wait_text} 後に電源ON")
 
 with inspection_col:
     st.markdown("**日常点検**")
@@ -1914,6 +2022,123 @@ with inspection_col:
             f'（{inspection_start_time.strftime("%H:%M")}開始）</div>',
             unsafe_allow_html=True,
         )
+
+# --- UI：次にやること（先々の予定表は表示しない） ---
+st.header("⏭️ 次にやること")
+
+next_power_action, next_power_time = get_next_power_action(now)
+next_mfr = next(
+    (
+        item for item in valid_upcoming
+        if item['machine'] != '日常点検(A勤)'
+        and item['est_time'] is not None
+    ),
+    None,
+)
+
+action_col, measure_col = st.columns(2)
+
+with action_col:
+    if next_power_action and isinstance(next_power_time, datetime):
+        power_time_text = format_next_action_time(next_power_time, now)
+        is_overdue = next_power_time <= now
+        card_class = (
+            "next-action-red"
+            if is_overdue
+            else "next-action-yellow"
+        )
+        if next_power_action == 'ON':
+            action_icon = "⚡"
+            action_text = "MFR電源 ON"
+        else:
+            action_icon = "○"
+            action_text = "MFR電源 OFF"
+
+        if is_overdue:
+            sub_text = (
+                f"予定 {next_power_time.strftime('%H:%M')}　"
+                f"→ 今すぐ操作してください"
+            )
+        else:
+            remaining_min = max(
+                0,
+                int((next_power_time - now).total_seconds() // 60),
+            )
+            sub_text = f"あと {format_remaining_time(remaining_min)}"
+
+        st.markdown(
+            f"""
+            <div class="next-action-card {card_class}">
+                <div class="next-action-label">① 次の電源操作</div>
+                <div class="next-action-main">{action_icon} {action_text}</div>
+                <div class="next-action-main">{power_time_text}</div>
+                <div class="next-action-sub">{sub_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            """
+            <div class="next-action-card next-action-gray">
+                <div class="next-action-label">① 次の電源操作</div>
+                <div class="next-action-main">予定なし</div>
+                <div class="next-action-sub">現在、電源操作の予定はありません。</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+with measure_col:
+    if next_mfr is not None:
+        measurement_time = next_mfr['est_time']
+        measurement_time_text = format_next_action_time(
+            measurement_time,
+            now,
+        )
+        meas_text = get_measurement_text(
+            len(next_mfr['Targets']),
+            next_mfr['target_qty'],
+            next_mfr['Targets'],
+        )
+        remaining_min = max(
+            0,
+            int((measurement_time - now).total_seconds() // 60),
+        )
+        measure_class = (
+            "next-action-red"
+            if measurement_time <= now
+            else "next-action-blue"
+        )
+        sub_text = (
+            "測定時刻です。今すぐ確認してください"
+            if measurement_time <= now
+            else f"あと {format_remaining_time(remaining_min)}"
+        )
+        st.markdown(
+            f"""
+            <div class="next-action-card {measure_class}">
+                <div class="next-action-label">② 次のMFR測定</div>
+                <div class="next-action-main">🎯 {next_mfr['machine']}・{meas_text}</div>
+                <div class="next-action-main">{measurement_time_text}</div>
+                <div class="next-action-sub">{sub_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            """
+            <div class="next-action-card next-action-gray">
+                <div class="next-action-label">② 次のMFR測定</div>
+                <div class="next-action-main">予定なし</div>
+                <div class="next-action-sub">現在、MFR測定の予定はありません。</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+st.caption("※先々の予定は表示せず、次に必要な電源操作とMFR測定だけを表示しています。")
 
 st.markdown("---")
 
@@ -2109,6 +2334,48 @@ def render_production_finish_confirmation_dialog():
             st.rerun()
 
 
+def render_signboard_confirmation_dialog():
+    """MFR電源OFF確認後に、表示札への次回ON時刻記入を確認する。"""
+    pending = st.session_state.get('pending_signboard_confirmation')
+    if not pending:
+        return
+
+    next_on_time = pending.get('next_on_time')
+    now_jst = datetime.utcnow() + timedelta(hours=9)
+
+    st.markdown("### MFR電源表示札を確認してください")
+
+    if isinstance(next_on_time, datetime):
+        next_on_text = format_next_action_time(next_on_time, now_jst)
+        st.markdown(
+            f"<div style='font-size:2rem;font-weight:900;"
+            f"text-align:center;color:#0b2f6b;margin:0.5rem 0 0.8rem;'>"
+            f"次の電源ON　{next_on_text}</div>",
+            unsafe_allow_html=True,
+        )
+        st.write("次の電源ON予定時刻を表示札に記入しましたか？")
+        confirm_text = "✅ はい、記入しました"
+    else:
+        st.markdown(
+            "<div style='font-size:1.7rem;font-weight:900;"
+            "text-align:center;color:#334155;margin:0.5rem 0 0.8rem;'>"
+            "次の電源ON予定はありません</div>",
+            unsafe_allow_html=True,
+        )
+        st.write("表示札をOFF状態にしましたか？")
+        confirm_text = "✅ はい、確認しました"
+
+    if st.button(
+        confirm_text,
+        type="primary",
+        use_container_width=True,
+        key="confirm_signboard_written",
+    ):
+        st.session_state.pending_signboard_confirmation = None
+        save_state()
+        st.rerun()
+
+
 def render_mfr_power_confirmation_dialog():
     """生産開始時に、実機MFRの現在の電源状態だけを簡潔に確認する。"""
     pending = st.session_state.get('pending_production_start')
@@ -2153,6 +2420,20 @@ def render_mfr_power_confirmation_dialog():
         st.rerun()
 
 
+# 電源OFF後の表示札記入確認ダイアログ。
+if hasattr(st, "dialog"):
+    show_signboard_confirmation_dialog = st.dialog(
+        "📝 表示札の確認",
+        width="small",
+    )(render_signboard_confirmation_dialog)
+elif hasattr(st, "experimental_dialog"):
+    show_signboard_confirmation_dialog = st.experimental_dialog(
+        "📝 表示札の確認",
+    )(render_signboard_confirmation_dialog)
+else:
+    show_signboard_confirmation_dialog = render_signboard_confirmation_dialog
+
+
 # 最終測定後の生産終了確認ダイアログ。
 if hasattr(st, "dialog"):
     show_production_finish_confirmation_dialog = st.dialog(
@@ -2186,7 +2467,9 @@ else:
     )
 
 
-if st.session_state.get('pending_production_finish_confirmation'):
+if st.session_state.get('pending_signboard_confirmation'):
+    show_signboard_confirmation_dialog()
+elif st.session_state.get('pending_production_finish_confirmation'):
     show_production_finish_confirmation_dialog()
 elif st.session_state.get('pending_production_start'):
     show_mfr_power_confirmation_dialog()
@@ -2403,38 +2686,6 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 else:
                     st.warning("稼働していません。")
 st.markdown("---")
-
-# --- UI：シフト別スケジュール表 ---
-def get_shift_name(dt):
-    h = dt.hour
-    if 7 <= h < 15: return "A勤"
-    elif 15 <= h < 23: return "B勤"
-    else: return "C勤"
-
-st.header("🗓️ 電源・測定予定")
-if on_blocks:
-    html = "<table style='width:100%; border-collapse: collapse; font-size: 20px; text-align: center; margin-bottom: 20px;'>"
-    html += "<tr style='background-color: #f3f4f6; color: #111; font-weight: bold; border-bottom: 3px solid #ccc;'><th style='padding: 15px; border: 1px solid #ddd; width: 10%;'>状態</th><th style='padding: 15px; border: 1px solid #ddd; width: 30%;'>電源ON</th><th style='padding: 15px; border: 1px solid #ddd;'>作業</th></tr>"
-    for b_start, b_end in on_blocks:
-        status_text = "完了" if b_end < now else ("進行中" if b_start <= now <= b_end else "予定")
-        bg_color = "#dbeafe" if status_text == "完了" else ("#fff3bf" if status_text == "進行中" else "#f8fafc")
-        on_assignee = get_shift_name(b_start)
-        on_time = b_start.strftime('%m/%d %H:%M')
-        
-        tasks_in_flow = []
-        for pt in valid_upcoming:
-            if b_start <= pt['est_time'] <= b_end:
-                if pt['machine'] == '日常点検(A勤)': tasks_in_flow.append("日常点検")
-                else: tasks_in_flow.append(f"{pt['machine']}MFR測定({get_measurement_text(len(pt['Targets']), pt['target_qty'], pt['Targets'])})")
-        
-        flow_full_text = " ➡ ".join(tasks_in_flow) + " ➡ OFF" if tasks_in_flow else "➡ OFF (測定なし)"
-        flow_full_html = f"<span style='color: #000; font-size: 22px;'>➡</span> {flow_full_text}"
-        
-        html += f"<tr style='background-color: {bg_color}; border-bottom: 1px solid #ddd;'><td style='padding: 15px; font-weight: bold;'>{status_text}</td><td style='padding: 15px; font-weight: bold;'><span style='color: #d32f2f; font-size: 24px;'>🔥 ON: </span> {on_assignee} ({on_time})</td><td style='padding: 15px; font-weight: bold; text-align: left;'>{flow_full_html}</td></tr>"
-    html += "</table>"
-    st.markdown(html, unsafe_allow_html=True)
-else:
-    st.info("現在、予定されている電源操作はありません。")
 
 # --- UI：全体可視化グラフ ---
 st.header("📈 稼働・MFRスケジュール")
