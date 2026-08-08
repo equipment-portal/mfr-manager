@@ -1,3 +1,4 @@
+# Version 1.6.9: 「次にやること」をタイムラインのONバーと完全同期・電源操作と測定を時刻順に左右自動並べ替え
 # Version 1.6.8: 今後予定を「次の電源操作・次のMFR測定」に集約／電源OFF確認後に表示札記入確認ダイアログ
 # Version 1.6.7: 色弱でも判別しやすい配色へ全面調整（青=正常/完了、黄橙=要操作、赤=アラート、灰=停止）
 # Version 1.6.6: MFR測定ボタンを未測定=オレンジ・測定済み=緑へ色分けし、状態が明確な文言へ変更
@@ -1650,50 +1651,49 @@ def get_next_power_on_time(reference_time=None):
 
 
 def get_next_power_action(reference_time):
-    """作業者が次に行うMFR電源操作（ON/OFF）を1件だけ返す。"""
+    """
+    タイムラインの赤いMFR電源ONバー（on_blocks）と同じ予定から、
+    作業者が次に行う電源操作を1件だけ返す。
+
+    V1.6.9では、PC側のON記録だけを理由に未来のOFF時刻を先に表示しない。
+    これにより「次にやること」とタイムラインの開始／終了時刻を完全に一致させる。
+    """
     power_is_on = bool(st.session_state.get('mfr_power_is_on', False))
 
-    if power_is_on:
-        pending_off = st.session_state.get('pending_power_off_due')
-        if isinstance(pending_off, datetime) and pending_off >= reference_time:
-            return 'OFF', pending_off
-
-        current_or_next_ends = [
-            block_end
+    # 現在時刻が赤いONバーの中にいる場合：
+    # 実機ONなら次はバー終端でOFF、実機OFFならON予定を過ぎているので今すぐON。
+    active_blocks = sorted(
+        (
+            (block_start, block_end)
             for block_start, block_end in on_blocks
-            if block_end >= reference_time
-            and block_start <= reference_time
-        ]
-        if current_or_next_ends:
-            return 'OFF', min(current_or_next_ends)
+            if block_start <= reference_time < block_end
+        ),
+        key=lambda block: block[0],
+    )
+    if active_blocks:
+        block_start, block_end = active_blocks[0]
+        if power_is_on:
+            pending_off = st.session_state.get('pending_power_off_due')
+            if (
+                isinstance(pending_off, datetime)
+                and reference_time <= pending_off <= block_end
+            ):
+                return 'OFF', pending_off
+            return 'OFF', block_end
+        return 'ON', block_start
 
-        # PC上ではONだが現在のON区間が特定できない場合は、
-        # 次のON区間終了時刻を参考OFF予定として表示する。
-        future_ends = [
-            block_end
+    # 赤いONバーの外にいる場合は、次に始まるバーの開始時刻＝次のON操作。
+    # PC側に古いON記録が残っていても、未来のOFFを先に表示しない。
+    future_blocks = sorted(
+        (
+            (block_start, block_end)
             for block_start, block_end in on_blocks
-            if block_end >= reference_time
-        ]
-        if future_ends:
-            return 'OFF', min(future_ends)
-        return None, None
-
-    # 電源OFF中。現在すでにON予定時刻を過ぎている区間があれば「今すぐON」。
-    active_starts = [
-        block_start
-        for block_start, block_end in on_blocks
-        if block_start <= reference_time <= block_end
-    ]
-    if active_starts:
-        return 'ON', min(active_starts)
-
-    future_starts = [
-        block_start
-        for block_start, _ in on_blocks
-        if block_start > reference_time
-    ]
-    if future_starts:
-        return 'ON', min(future_starts)
+            if block_start > reference_time
+        ),
+        key=lambda block: block[0],
+    )
+    if future_blocks:
+        return 'ON', future_blocks[0][0]
 
     return None, None
 
@@ -2023,7 +2023,7 @@ with inspection_col:
             unsafe_allow_html=True,
         )
 
-# --- UI：次にやること（先々の予定表は表示しない） ---
+# --- UI：次にやること（タイムラインと同じ予定を時刻順に表示） ---
 st.header("⏭️ 次にやること")
 
 next_power_action, next_power_time = get_next_power_action(now)
@@ -2036,109 +2036,144 @@ next_mfr = next(
     None,
 )
 
-action_col, measure_col = st.columns(2)
+# 電源操作とMFR測定を同じ「次の作業」として扱い、予定時刻で並べ替える。
+# 早い作業を左、遅い作業を右へ自動配置する。
+next_actions = []
 
-with action_col:
-    if next_power_action and isinstance(next_power_time, datetime):
-        power_time_text = format_next_action_time(next_power_time, now)
-        is_overdue = next_power_time <= now
-        card_class = (
-            "next-action-red"
-            if is_overdue
-            else "next-action-yellow"
-        )
-        if next_power_action == 'ON':
-            action_icon = "⚡"
-            action_text = "MFR電源 ON"
-        else:
-            action_icon = "○"
-            action_text = "MFR電源 OFF"
+if next_power_action and isinstance(next_power_time, datetime):
+    next_actions.append({
+        'type': 'power',
+        'time': next_power_time,
+        'power_action': next_power_action,
+    })
 
-        if is_overdue:
-            sub_text = (
-                f"予定 {next_power_time.strftime('%H:%M')}　"
-                f"→ 今すぐ操作してください"
+if next_mfr is not None and isinstance(next_mfr.get('est_time'), datetime):
+    next_actions.append({
+        'type': 'measurement',
+        'time': next_mfr['est_time'],
+        'measurement': next_mfr,
+    })
+
+# 同時刻の場合は電源操作を先にする（通常はONが測定60分前なので同時にはならない）。
+next_actions.sort(
+    key=lambda item: (
+        item['time'],
+        0 if item['type'] == 'power' else 1,
+    )
+)
+
+# 2列を維持するため、予定が1件だけの場合は右側を「予定なし」とする。
+while len(next_actions) < 2:
+    next_actions.append({
+        'type': 'none',
+        'time': None,
+    })
+
+left_col, right_col = st.columns(2)
+
+for order_no, (column, action_item) in enumerate(
+    zip((left_col, right_col), next_actions[:2]),
+    start=1,
+):
+    with column:
+        action_type = action_item['type']
+
+        if action_type == 'power':
+            action_time = action_item['time']
+            power_action = action_item['power_action']
+            time_text = format_next_action_time(action_time, now)
+            is_overdue = action_time <= now
+            card_class = (
+                "next-action-red"
+                if is_overdue
+                else "next-action-yellow"
             )
-        else:
+
+            if power_action == 'ON':
+                action_icon = "⚡"
+                action_text = "MFR電源 ON"
+            else:
+                action_icon = "○"
+                action_text = "MFR電源 OFF"
+
+            if is_overdue:
+                sub_text = (
+                    f"予定 {action_time.strftime('%H:%M')}　"
+                    "→ 今すぐ操作してください"
+                )
+            else:
+                remaining_min = max(
+                    0,
+                    int((action_time - now).total_seconds() // 60),
+                )
+                sub_text = f"あと {format_remaining_time(remaining_min)}"
+
+            st.markdown(
+                f"""
+                <div class="next-action-card {card_class}">
+                    <div class="next-action-label">{"①" if order_no == 1 else "②"} 次の電源操作</div>
+                    <div class="next-action-main">{action_icon} {action_text}</div>
+                    <div class="next-action-main">{time_text}</div>
+                    <div class="next-action-sub">{sub_text}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        elif action_type == 'measurement':
+            measurement = action_item['measurement']
+            measurement_time = action_item['time']
+            measurement_time_text = format_next_action_time(
+                measurement_time,
+                now,
+            )
+            meas_text = get_measurement_text(
+                len(measurement['Targets']),
+                measurement['target_qty'],
+                measurement['Targets'],
+            )
             remaining_min = max(
                 0,
-                int((next_power_time - now).total_seconds() // 60),
+                int((measurement_time - now).total_seconds() // 60),
             )
-            sub_text = f"あと {format_remaining_time(remaining_min)}"
+            measure_class = (
+                "next-action-red"
+                if measurement_time <= now
+                else "next-action-blue"
+            )
+            sub_text = (
+                "測定時刻です。今すぐ確認してください"
+                if measurement_time <= now
+                else f"あと {format_remaining_time(remaining_min)}"
+            )
 
-        st.markdown(
-            f"""
-            <div class="next-action-card {card_class}">
-                <div class="next-action-label">① 次の電源操作</div>
-                <div class="next-action-main">{action_icon} {action_text}</div>
-                <div class="next-action-main">{power_time_text}</div>
-                <div class="next-action-sub">{sub_text}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            """
-            <div class="next-action-card next-action-gray">
-                <div class="next-action-label">① 次の電源操作</div>
-                <div class="next-action-main">予定なし</div>
-                <div class="next-action-sub">現在、電源操作の予定はありません。</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            st.markdown(
+                f"""
+                <div class="next-action-card {measure_class}">
+                    <div class="next-action-label">{"①" if order_no == 1 else "②"} 次のMFR測定</div>
+                    <div class="next-action-main">🎯 {measurement['machine']}・{meas_text}</div>
+                    <div class="next-action-main">{measurement_time_text}</div>
+                    <div class="next-action-sub">{sub_text}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-with measure_col:
-    if next_mfr is not None:
-        measurement_time = next_mfr['est_time']
-        measurement_time_text = format_next_action_time(
-            measurement_time,
-            now,
-        )
-        meas_text = get_measurement_text(
-            len(next_mfr['Targets']),
-            next_mfr['target_qty'],
-            next_mfr['Targets'],
-        )
-        remaining_min = max(
-            0,
-            int((measurement_time - now).total_seconds() // 60),
-        )
-        measure_class = (
-            "next-action-red"
-            if measurement_time <= now
-            else "next-action-blue"
-        )
-        sub_text = (
-            "測定時刻です。今すぐ確認してください"
-            if measurement_time <= now
-            else f"あと {format_remaining_time(remaining_min)}"
-        )
-        st.markdown(
-            f"""
-            <div class="next-action-card {measure_class}">
-                <div class="next-action-label">② 次のMFR測定</div>
-                <div class="next-action-main">🎯 {next_mfr['machine']}・{meas_text}</div>
-                <div class="next-action-main">{measurement_time_text}</div>
-                <div class="next-action-sub">{sub_text}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            """
-            <div class="next-action-card next-action-gray">
-                <div class="next-action-label">② 次のMFR測定</div>
-                <div class="next-action-main">予定なし</div>
-                <div class="next-action-sub">現在、MFR測定の予定はありません。</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        else:
+            st.markdown(
+                f"""
+                <div class="next-action-card next-action-gray">
+                    <div class="next-action-label">{"①" if order_no == 1 else "②"} 次の予定</div>
+                    <div class="next-action-main">予定なし</div>
+                    <div class="next-action-sub">現在、次に必要な操作はありません。</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-st.caption("※先々の予定は表示せず、次に必要な電源操作とMFR測定だけを表示しています。")
+st.caption(
+    "※タイムラインと同じ予定を使用し、時刻が早い作業を左側に表示しています。"
+)
 
 st.markdown("---")
 
@@ -2757,7 +2792,7 @@ for pt in valid_upcoming:
         measurement_points.append({'Task': 'MFR電源', 'Time': pt['est_time'], 'Target_Qty': '日常点検', 'Targets': ['日常点検'], 'Status': 'Planned'})
 
 for b_start, b_end in on_blocks:
-    timeline_data.append({'Task': 'MFR電源', 'Start': max(b_start, now), 'End': max(b_end, now), 'Status': 'ON'})
+    timeline_data.append({'Task': 'MFR電源', 'Start': b_start, 'End': b_end, 'Status': 'ON'})
 
 DUMMY_DATE = datetime(2000, 1, 1)
 def time_to_dummy(dt):
