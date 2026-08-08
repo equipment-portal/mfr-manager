@@ -1,3 +1,4 @@
+# Version 1.5.5: アラート経過時間を時間・分表示、監視開始後のボタン文言を簡略化
 # Version 1.5.4: 初回MFR測定を加熱60分後へ修正・通知タイミング再確認
 # Version 1.5.3: 次回測定までの残り時間を時間・分表示へ変更
 # Version 1.5.2: UI表記をアラート／通知へ統一
@@ -708,6 +709,7 @@ def render_monitor_activation():
           }}
 
           hideStatus();
+          button.textContent = "監視開始、チャイム音・Windows通知テスト";
           button.style.background = "#15803d";
 
         }} catch (error) {{
@@ -1341,13 +1343,17 @@ if active_alerts:
         primary_alert["message"],
     )
 
-    overdue_minutes = max(0, int((now - primary_alert["due"]).total_seconds() // 60))
+    overdue_minutes = max(
+        0,
+        int((now - primary_alert["due"]).total_seconds() // 60),
+    )
+    overdue_time_text = format_remaining_time(overdue_minutes)
     st.markdown(
         f"""
         <div class="mfr-active-alert">
             <div style="font-size:1.7rem;font-weight:800;">{primary_alert["title"]}</div>
             <div style="font-size:1.25rem;margin-top:8px;">{primary_alert["message"]}</div>
-            <div style="font-size:1rem;margin-top:8px;">予定から {overdue_minutes} 分経過</div>
+            <div style="font-size:1rem;margin-top:8px;">予定から {overdue_time_text} 経過</div>
         </div>
         """,
         unsafe_allow_html=True,
