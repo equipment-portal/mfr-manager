@@ -1,3 +1,4 @@
+# Version 1.5.7: 「▼ 現在」の三角位置を点線上へ修正
 # Version 1.5.6: タイムライン黄色測定マークを加熱60分後の予定時刻へ統一
 # Version 1.5.5: アラート経過時間を時間・分表示、監視開始後のボタン文言を簡略化
 # Version 1.5.4: 初回MFR測定を加熱60分後へ修正・通知タイミング再確認
@@ -1794,9 +1795,38 @@ if new_timeline_data:
         now_dummy_time = time_to_dummy(now)
         fig.add_vline(x=now_dummy_time, line_width=3, line_dash="dash", line_color="#ff0000", layer="above", row=today_row, col=1)
         yref_name = f"y{today_row if today_row > 1 else ''} domain"
+        # 「▼」を現在時刻の点線の真上へ置き、
+        # 「現在」は右側へ分けて表示する。
         fig.add_annotation(
-            x=now_dummy_time, y=1.02, yref=yref_name, text="▼ 現在", font=dict(size=18, color="#ff0000", weight="bold"), 
-            showarrow=False, xanchor="center", yanchor="bottom", bgcolor="white", bordercolor="#ff0000", borderwidth=1, row=today_row, col=1
+            x=now_dummy_time,
+            y=1.02,
+            yref=yref_name,
+            text="▼",
+            font=dict(size=20, color="#ff0000", weight="bold"),
+            showarrow=False,
+            xanchor="center",
+            yanchor="bottom",
+            bgcolor="white",
+            bordercolor="#ff0000",
+            borderwidth=1,
+            row=today_row,
+            col=1,
+        )
+        fig.add_annotation(
+            x=now_dummy_time,
+            xshift=18,
+            y=1.02,
+            yref=yref_name,
+            text="現在",
+            font=dict(size=18, color="#ff0000", weight="bold"),
+            showarrow=False,
+            xanchor="left",
+            yanchor="bottom",
+            bgcolor="white",
+            bordercolor="#ff0000",
+            borderwidth=1,
+            row=today_row,
+            col=1,
         )
 
     fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1], font=dict(size=22, weight="bold", color="black")) if "=" in a.text else None)
