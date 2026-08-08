@@ -1,3 +1,5 @@
+# Version 1.6.7: 色弱でも判別しやすい配色へ全面調整（青=正常/完了、黄橙=要操作、赤=アラート、灰=停止）
+# Version 1.6.6: MFR測定ボタンを未測定=オレンジ・測定済み=緑へ色分けし、状態が明確な文言へ変更
 # Version 1.6.5: 始・中のMFR測定完了を再押下で取消可能・通知履歴と電源ONバーも復元
 # Version 1.6.4: 上部UI再整理・成型中回転表示・測定アラート確認で測定完了・最終測定後に生産終了確認
 # Version 1.6.3: 現場操作画面を簡潔化・実機MFR電源確認ダイアログをシンプル化
@@ -751,8 +753,8 @@ def render_monitor_activation():
           }}
 
           hideStatus();
-          button.textContent = "チャイム音・Windows通知テスト";
-          button.style.background = "#15803d";
+          button.textContent = "✓ チャイム音・Windows通知テスト";
+          button.style.background = "#1e40af";
 
         }} catch (error) {{
           showError(
@@ -995,6 +997,92 @@ st.markdown(
 
     .stButton button { width: 100%; border-radius: 5px; }
 
+    /* =========================================================
+       色弱に配慮した状態配色
+       青 = 正常・完了 / 黄橙 = 未実施・要操作 / 赤 = アラート / 灰 = 停止
+       色だけに依存せず、文字・記号も必ず併用する。
+       ========================================================= */
+
+    /* MFR測定：未測定は黄橙色のボタン */
+    [class*="st-key-comp_"] button,
+    [class*="st-key-comp-"] button {
+        background: #facc15 !important;
+        border: 3px solid #8a5a00 !important;
+        color: #111827 !important;
+        font-weight: 900 !important;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.65) !important;
+    }
+
+    [class*="st-key-comp_"] button:hover,
+    [class*="st-key-comp-"] button:hover {
+        background: #fde047 !important;
+        border-color: #713f12 !important;
+        color: #111827 !important;
+    }
+
+    /* MFR測定：測定済み（取消可能）は青いボタン */
+    [class*="st-key-undo_comp_"] button,
+    [class*="st-key-undo-comp-"] button {
+        background: #2563eb !important;
+        border: 3px solid #1e3a8a !important;
+        color: #ffffff !important;
+        font-weight: 900 !important;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.65) !important;
+    }
+
+    [class*="st-key-undo_comp_"] button:hover,
+    [class*="st-key-undo-comp-"] button:hover {
+        background: #1d4ed8 !important;
+        border-color: #172554 !important;
+        color: #ffffff !important;
+    }
+
+    /* 最終測定済み：操作不可の青い状態表示 */
+    .mfr-measurement-done-static {
+        width: 100%;
+        box-sizing: border-box;
+        text-align: center;
+        background: #2563eb;
+        border: 3px solid #1e3a8a;
+        color: #ffffff;
+        border-radius: 5px;
+        padding: 0.46rem 0.75rem;
+        font-weight: 900;
+        line-height: 1.45;
+        margin-bottom: 0.45rem;
+    }
+
+    /* 通常状態カード（Streamlit success/error の赤緑依存を避ける） */
+    .status-card {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 8px;
+        padding: 0.62rem 0.85rem;
+        margin: 0.15rem 0 0.35rem 0;
+        font-weight: 800;
+        line-height: 1.35;
+    }
+    .status-blue {
+        background: #e8f1ff;
+        border: 2px solid #2563eb;
+        color: #0b3b8c;
+    }
+    .status-yellow {
+        background: #fff7cc;
+        border: 2px solid #d97706;
+        color: #6b3a00;
+    }
+    .status-red {
+        background: #fee2e2;
+        border: 2px solid #dc2626;
+        color: #7f1d1d;
+    }
+    .status-gray {
+        background: #f1f5f9;
+        border: 2px solid #94a3b8;
+        color: #334155;
+    }
+
     .mfr-active-alert {
         background: #b91c1c;
         color: white;
@@ -1026,27 +1114,27 @@ st.markdown(
     }
 
     .machine-running-badge {
-        background: #ecfdf5;
-        border: 2px solid #22c55e;
-        color: #166534;
+        background: #dbeafe;
+        border: 3px solid #2563eb;
+        color: #0b3b8c;
     }
 
     .machine-paused-badge {
-        background: #fffbeb;
-        border: 2px solid #f59e0b;
-        color: #92400e;
+        background: #fff3bf;
+        border: 3px solid #d97706;
+        color: #6b3a00;
     }
 
     .machine-completed-badge {
-        background: #eff6ff;
-        border: 2px solid #60a5fa;
-        color: #1d4ed8;
+        background: #e0f2fe;
+        border: 3px solid #0369a1;
+        color: #075985;
     }
 
     .machine-idle-badge {
-        background: #f3f4f6;
-        border: 2px solid #cbd5e1;
-        color: #475569;
+        background: #f1f5f9;
+        border: 2px solid #94a3b8;
+        color: #334155;
     }
 
     .machine-spin {
@@ -1234,7 +1322,7 @@ with st.sidebar:
                 save_state()
                 save_products_to_github(st.session_state.products) # ★GitHubに自動バックアップ！
                 
-                st.success(f"「{p_name} ({p_machine})」をクラウドに登録・更新しました！")
+                st.info(f"✓ 「{p_name} ({p_machine})」をクラウドに登録・更新しました！")
                 st.rerun()
         
         # 4. 削除ツール
@@ -1246,7 +1334,7 @@ with st.sidebar:
                 save_state()
                 save_products_to_github(st.session_state.products) # ★削除もGitHubに同期！
                 
-                st.success(f"「{del_name}」をクラウドから削除しました。")
+                st.info(f"✓ 「{del_name}」をクラウドから削除しました。")
                 st.rerun()
 
     st.markdown("---")
@@ -1672,7 +1760,7 @@ if active_alerts:
     )
 
     if primary_alert["kind"] == "measurement":
-        ack_button_text = "✅ 測定完了（通知音を停止）"
+        ack_button_text = "✅ 測定済みとして記録（通知音を停止）"
     else:
         ack_button_text = "✅ 確認しました（通知音を停止）"
 
@@ -1735,7 +1823,10 @@ if active_alerts:
                 )
 else:
     stop_browser_alarm()
-    st.success("✅ アラートなし")
+    st.markdown(
+        '<div class="status-card status-blue">✓ アラートなし</div>',
+        unsafe_allow_html=True,
+    )
 
 st.caption("※シフト開始時に青いボタンを1回押し、Edgeは開いたままにしてください。")
 
@@ -1746,9 +1837,15 @@ with status_col:
     st.markdown("**MFR電源**")
 
     if st.session_state.get('mfr_power_is_on', False):
-        st.error("🔥 電源 ON")
+        st.markdown(
+            '<div class="status-card status-blue">⚡ MFR電源 ON</div>',
+            unsafe_allow_html=True,
+        )
     else:
-        st.success("💤 電源 OFF")
+        st.markdown(
+            '<div class="status-card status-gray">○ MFR電源 OFF</div>',
+            unsafe_allow_html=True,
+        )
 
     if not valid_upcoming:
         st.caption("次回の測定予定なし")
@@ -1794,10 +1891,15 @@ with inspection_col:
     )
 
     if st.session_state.last_inspection_date == today_date:
-        st.success("✅ 完了")
+        st.markdown(
+            '<div class="status-card status-blue">✅ 点検済み</div>',
+            unsafe_allow_html=True,
+        )
     elif now >= inspection_start_time:
-        st.error(
-            f"📋 未完了（{inspection_start_time.strftime('%H:%M')}予定）"
+        st.markdown(
+            f'<div class="status-card status-red">! 点検未完了 '
+            f'（{inspection_start_time.strftime("%H:%M")}予定）</div>',
+            unsafe_allow_html=True,
         )
         if st.button("✅ 日常点検 完了", key="inspection_complete_top"):
             st.session_state.last_inspection_date = today_date
@@ -1807,8 +1909,10 @@ with inspection_col:
             save_state()
             st.rerun()
     else:
-        st.warning(
-            f"📋 未実施（{inspection_start_time.strftime('%H:%M')}開始）"
+        st.markdown(
+            f'<div class="status-card status-yellow">○ 点検未実施 '
+            f'（{inspection_start_time.strftime("%H:%M")}開始）</div>',
+            unsafe_allow_html=True,
         )
 
 st.markdown("---")
@@ -2025,7 +2129,7 @@ def render_mfr_power_confirmation_dialog():
 
     with col_on:
         if st.button(
-            "🟢 ON",
+            "⚡ ON",
             type="primary",
             use_container_width=True,
             key="confirm_mfr_power_on",
@@ -2034,7 +2138,7 @@ def render_mfr_power_confirmation_dialog():
 
     with col_off:
         if st.button(
-            "⚫ OFF",
+            "○ OFF",
             use_container_width=True,
             key="confirm_mfr_power_off",
         ):
@@ -2234,9 +2338,9 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
 
                 if t in job['completed']:
                     if t != final_target:
-                        # 「始」「中」は完了ボタンをもう一度押すと取消できる。
+                        # 測定済みは青。再押下すると未測定へ戻せることも明示する。
                         if st.button(
-                            f"✅ {meas_text}　完了（押すと未測定へ戻す）",
+                            f"✅ {meas_text}　測定済み　｜　押すと取消",
                             key=f"undo_comp_{machine}_{t}",
                             use_container_width=True,
                         ):
@@ -2245,11 +2349,16 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                                 st.rerun()
                     else:
                         # 最終測定は生産終了確認と連動するため、
-                        # 誤操作防止のためワンタッチ取消にはしない。
-                        st.write(f"✅ {meas_text}　完了")
+                        # 青の測定済み表示のみとし、ワンタッチ取消にはしない。
+                        st.markdown(
+                            f'<div class="mfr-measurement-done-static">'
+                            f'✅ {meas_text}　測定済み</div>',
+                            unsafe_allow_html=True,
+                        )
                 else:
+                    # 未測定は黄橙。現在の状態と押すタイミングを明示する。
                     if st.button(
-                        f"🎯 {meas_text}　測定完了",
+                        f"○ {meas_text}　未測定　｜　測定後に押す",
                         key=f"comp_{machine}_{t}",
                         use_container_width=True,
                     ):
@@ -2308,7 +2417,7 @@ if on_blocks:
     html += "<tr style='background-color: #f3f4f6; color: #111; font-weight: bold; border-bottom: 3px solid #ccc;'><th style='padding: 15px; border: 1px solid #ddd; width: 10%;'>状態</th><th style='padding: 15px; border: 1px solid #ddd; width: 30%;'>電源ON</th><th style='padding: 15px; border: 1px solid #ddd;'>作業</th></tr>"
     for b_start, b_end in on_blocks:
         status_text = "完了" if b_end < now else ("進行中" if b_start <= now <= b_end else "予定")
-        bg_color = "#e6ffe6" if status_text == "完了" else ("#fffdeb" if status_text == "進行中" else "#ffffff")
+        bg_color = "#dbeafe" if status_text == "完了" else ("#fff3bf" if status_text == "進行中" else "#f8fafc")
         on_assignee = get_shift_name(b_start)
         on_time = b_start.strftime('%m/%d %H:%M')
         
@@ -2438,7 +2547,7 @@ if new_timeline_data:
     
     fig = px.timeline(
         df, x_start="StartDummy", x_end="EndDummy", y="Task", color="Status", facet_row="DateStr",
-        color_discrete_map={'Running': '#00a82d', 'Paused': '#f5a623', 'Completed': '#88d8b0', 'ON': '#ff3333'},
+        color_discrete_map={'Running': '#2563eb', 'Paused': '#d97706', 'Completed': '#0891b2', 'ON': '#dc2626'},
         facet_row_spacing=0.15,
         category_orders={"DateStr": unique_dates, "Task": ["MFR電源", "550t", "450t", "100t"]} 
     )
@@ -2470,7 +2579,7 @@ if new_timeline_data:
 
     fig.add_vrect(x0=time_to_dummy(dt_time(0,0)), x1=time_to_dummy(dt_time(7,0)), fillcolor="#e6f2ff", opacity=0.4, layer="below", line_width=1, line_color="gray")
     fig.add_vrect(x0=time_to_dummy(dt_time(7,0)), x1=time_to_dummy(dt_time(15,0)), fillcolor="#fff5cc", opacity=0.4, layer="below", line_width=1, line_color="gray")
-    fig.add_vrect(x0=time_to_dummy(dt_time(15,0)), x1=time_to_dummy(dt_time(23,0)), fillcolor="#e6ffe6", opacity=0.4, layer="below", line_width=1, line_color="gray")
+    fig.add_vrect(x0=time_to_dummy(dt_time(15,0)), x1=time_to_dummy(dt_time(23,0)), fillcolor="#f3e8ff", opacity=0.4, layer="below", line_width=1, line_color="gray")
     fig.add_vrect(x0=time_to_dummy(dt_time(23,0)), x1=time_to_dummy(dt_time(23,59,59)), fillcolor="#e6f2ff", opacity=0.4, layer="below", line_width=1, line_color="gray")
 
     for facet_date in unique_dates:
@@ -2478,7 +2587,7 @@ if new_timeline_data:
         shifts_text = [
             ("C勤", time_to_dummy(dt_time(3, 30)), 'rgba(0,68,136,0.05)'),
             ("A勤", time_to_dummy(dt_time(11, 0)), 'rgba(136,102,0,0.05)'),
-            ("B勤", time_to_dummy(dt_time(19, 0)), 'rgba(0,102,0,0.05)')
+            ("B勤", time_to_dummy(dt_time(19, 0)), 'rgba(109,40,217,0.05)')
         ]
         for text, x_pos, color in shifts_text:
             fig.add_annotation(
@@ -2490,7 +2599,7 @@ if new_timeline_data:
     if today_str in date_to_row:
         today_row = date_to_row[today_str]
         now_dummy_time = time_to_dummy(now)
-        fig.add_vline(x=now_dummy_time, line_width=3, line_dash="dash", line_color="#ff0000", layer="above", row=today_row, col=1)
+        fig.add_vline(x=now_dummy_time, line_width=3, line_dash="dash", line_color="#c81e1e", layer="above", row=today_row, col=1)
         yref_name = f"y{today_row if today_row > 1 else ''} domain"
         # 「▼」を現在時刻の点線の真上へ置き、
         # 「現在」は右側へ分けて表示する。
@@ -2499,12 +2608,12 @@ if new_timeline_data:
             y=1.02,
             yref=yref_name,
             text="▼",
-            font=dict(size=20, color="#ff0000", weight="bold"),
+            font=dict(size=20, color="#c81e1e", weight="bold"),
             showarrow=False,
             xanchor="center",
             yanchor="bottom",
             bgcolor="white",
-            bordercolor="#ff0000",
+            bordercolor="#c81e1e",
             borderwidth=1,
             row=today_row,
             col=1,
@@ -2515,12 +2624,12 @@ if new_timeline_data:
             y=1.02,
             yref=yref_name,
             text="現在",
-            font=dict(size=18, color="#ff0000", weight="bold"),
+            font=dict(size=18, color="#c81e1e", weight="bold"),
             showarrow=False,
             xanchor="left",
             yanchor="bottom",
             bgcolor="white",
-            bordercolor="#ff0000",
+            bordercolor="#c81e1e",
             borderwidth=1,
             row=today_row,
             col=1,
@@ -2540,7 +2649,7 @@ if new_timeline_data:
                 trace_completed_text = ['点検済' if pt.get('Targets', []) and pt['Targets'][0] == '点検済' else get_measurement_text(len(pt.get('Targets', [])), pt['Target_Qty'], pt.get('Targets', [])) for pt in df_comp.to_dict('records')]
                 fig.add_trace(go.Scatter(
                     x=df_comp['TimeDummy'], y=df_comp['Task'], mode='markers+text',
-                    marker=dict(color='#00e6e6', size=18, symbol='circle', line=dict(width=2, color='black')),
+                    marker=dict(color='#2563eb', size=18, symbol='circle', line=dict(width=3, color='black')),
                     text=trace_completed_text, textposition='top center', textfont=dict(size=18, color='black', weight='bold'),
                     cliponaxis=False, hoverinfo='skip', showlegend=False 
                 ), row=row_idx, col=1)
@@ -2550,7 +2659,7 @@ if new_timeline_data:
                 trace_planned_text = ['日常点検' if pt.get('Targets', []) and pt['Targets'][0] == '日常点検' else get_measurement_text(len(pt.get('Targets', [])), pt['Target_Qty'], pt.get('Targets', [])) for pt in df_plan.to_dict('records')]
                 fig.add_trace(go.Scatter(
                     x=df_plan['TimeDummy'], y=df_plan['Task'], mode='markers+text',
-                    marker=dict(color='#ffff00', size=20, symbol='diamond', line=dict(width=2, color='black')),
+                    marker=dict(color='#ffd43b', size=20, symbol='diamond', line=dict(width=3, color='black')),
                     text=trace_planned_text, textposition='top center', textfont=dict(size=20, color='black', weight='bold'),
                     cliponaxis=False, hoverinfo='skip', showlegend=False 
                 ), row=row_idx, col=1)
@@ -2741,7 +2850,7 @@ with st.expander(
                 old_maint = 0.0
                 new_maint = 0.0
 
-            st.success(
+            st.info(
                 f"✨ **現在のスケジュール期間中"
                 f"（約 {total_hours:.1f} 時間・"
                 f"{managed_job_count} Lot）の改善効果**"
@@ -2990,7 +3099,7 @@ with st.expander(
                 yanchor="bottom",
                 text=f"<b>計 {int(total_new):,} 円</b>",
                 showarrow=False,
-                font=dict(size=22, color="#00a82d"),
+                font=dict(size=22, color="#1d4ed8"),
             )
 
             approx_dx_px = 500
