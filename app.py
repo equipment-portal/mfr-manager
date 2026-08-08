@@ -1,3 +1,5 @@
+# Version 1.6.5: 始・中のMFR測定完了を再押下で取消可能・通知履歴と電源ONバーも復元
+# Version 1.6.4: 上部UI再整理・成型中回転表示・測定アラート確認で測定完了・最終測定後に生産終了確認
 # Version 1.6.3: 現場操作画面を簡潔化・実機MFR電源確認ダイアログをシンプル化
 # Version 1.6.2: 監視開始後の緑ボタンから「監視開始」表記を削除・測定回数は製品マスター登録値を優先
 # Current spec: MFR測定回数は成型機固定ではなく、製品マスターの measurements（2回／3回）を使用
@@ -133,6 +135,10 @@ def save_state():
         'acknowledged_alerts': st.session_state.acknowledged_alerts,
         # 実際に測定・点検が完了した10分後の電源OFF通知
         'pending_power_off_due': st.session_state.pending_power_off_due,
+        # 最終MFR測定後の「生産も終了ですか？」確認待ち。
+        'pending_production_finish_confirmation': st.session_state.get(
+            'pending_production_finish_confirmation'
+        ),
         # 作業者が確認した実際のMFR電源状態。
         # ON確認後は、OFF確認されるまで再度ONアラートを出さない。
         'mfr_power_is_on': st.session_state.get('mfr_power_is_on', False),
@@ -635,9 +641,9 @@ def render_monitor_activation():
     parent_engine_code_js = json.dumps(parent_engine_code)
 
     html = f"""
-    <div style="font-family:Meiryo,sans-serif;border:2px solid #2563eb;
-                border-radius:10px;padding:12px;background:#eff6ff;">
-      <button id="mfr-enable" style="width:100%;padding:12px;font-size:17px;
+    <div style="font-family:Meiryo,sans-serif;border:1px solid #93c5fd;
+                border-radius:9px;padding:7px;background:#eff6ff;">
+      <button id="mfr-enable" style="width:100%;padding:9px;font-size:16px;
               font-weight:bold;color:white;background:#1d4ed8;border:0;
               border-radius:8px;cursor:pointer;">
         起動時に必ず押してください。監視開始、チャイム音・Windows通知テスト
@@ -763,7 +769,7 @@ def render_monitor_activation():
     </script>
     """
 
-    components.html(html, height=105, scrolling=False)
+    components.html(html, height=78, scrolling=False)
 
 
 
@@ -1004,6 +1010,63 @@ st.markdown(
         from { box-shadow: 0 0 0 rgba(185, 28, 28, 0.2); }
         to   { box-shadow: 0 0 28px rgba(185, 28, 28, 0.85); }
     }
+
+
+    /* 成型機の状態を一目で判別できるステータス表示 */
+    .machine-status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        padding: 0.34rem 0.78rem;
+        border-radius: 999px;
+        font-size: 1.03rem;
+        font-weight: 800;
+        margin: 0.05rem 0 0.35rem 0;
+        line-height: 1.2;
+    }
+
+    .machine-running-badge {
+        background: #ecfdf5;
+        border: 2px solid #22c55e;
+        color: #166534;
+    }
+
+    .machine-paused-badge {
+        background: #fffbeb;
+        border: 2px solid #f59e0b;
+        color: #92400e;
+    }
+
+    .machine-completed-badge {
+        background: #eff6ff;
+        border: 2px solid #60a5fa;
+        color: #1d4ed8;
+    }
+
+    .machine-idle-badge {
+        background: #f3f4f6;
+        border: 2px solid #cbd5e1;
+        color: #475569;
+    }
+
+    .machine-spin {
+        display: inline-block;
+        font-size: 1.35rem;
+        line-height: 1;
+        animation: machine-rotate 1.05s linear infinite;
+    }
+
+    @keyframes machine-rotate {
+        from { transform: rotate(0deg); }
+        to   { transform: rotate(360deg); }
+    }
+
+    .top-section-title {
+        font-size: 1.18rem;
+        font-weight: 800;
+        margin: 0.15rem 0 0.3rem 0;
+        color: #1f2937;
+    }
     
     /* 天井の余白設定 */
     .block-container { padding-top: 3.0rem !important; }
@@ -1037,6 +1100,9 @@ if 'initialized' not in st.session_state:
         st.session_state.last_inspection_date = saved_state['last_inspection_date']
         st.session_state.acknowledged_alerts = saved_state.get('acknowledged_alerts', [])
         st.session_state.pending_power_off_due = saved_state.get('pending_power_off_due')
+        st.session_state.pending_production_finish_confirmation = (
+            saved_state.get('pending_production_finish_confirmation')
+        )
 
         power_state_version = int(
             saved_state.get('mfr_power_state_version', 0)
@@ -1063,6 +1129,7 @@ if 'initialized' not in st.session_state:
         st.session_state.last_inspection_date = None
         st.session_state.acknowledged_alerts = []
         st.session_state.pending_power_off_due = None
+        st.session_state.pending_production_finish_confirmation = None
         st.session_state.mfr_power_is_on = False
         st.session_state.mfr_power_on_confirmed_at = None
         default_products = {
@@ -1117,6 +1184,8 @@ if 'mfr_power_on_confirmed_at' not in st.session_state:
     st.session_state.mfr_power_on_confirmed_at = None
 if 'pending_production_start' not in st.session_state:
     st.session_state.pending_production_start = None
+if 'pending_production_finish_confirmation' not in st.session_state:
+    st.session_state.pending_production_finish_confirmation = None
 
 # --- UI：サイドバー ---
 with st.sidebar:
@@ -1188,6 +1257,7 @@ with st.sidebar:
         st.session_state.mfr_power_is_on = False
         st.session_state.mfr_power_on_confirmed_at = None
         st.session_state.pending_production_start = None
+        st.session_state.pending_production_finish_confirmation = None
         save_state(); st.rerun()
         
     if st.button("🔄 今日の点検状態を未実施に戻す"):
@@ -1289,6 +1359,109 @@ def calculate_upcoming_measurements():
 
 valid_upcoming, all_upcoming = calculate_upcoming_measurements()
 
+
+def complete_mfr_measurement(machine, target_qty):
+    """
+    MFR測定を完了として記録する。
+
+    通知画面の確認ボタンと成型機パネルの手動ボタンで共通使用する。
+    最終測定まで完了した場合は、生産終了確認ダイアログを予約する。
+    """
+    job = st.session_state.jobs.get(machine)
+    if job is None or target_qty not in job.get('targets', []):
+        return False
+
+    now_jst = datetime.utcnow() + timedelta(hours=9)
+
+    # 稼働中なら、測定を完了した時点までの推定生産数を確定する。
+    if job.get('status') == 'Running':
+        elapsed_sec = (now_jst - job['last_update']).total_seconds()
+        job['current_qty'] = min(
+            int(job['current_qty'] + (elapsed_sec / job['cycle_time'])),
+            job['total_qty'],
+        )
+        job['last_update'] = now_jst
+
+    if target_qty not in job['completed']:
+        job['completed'].append(target_qty)
+
+    # 実際の測定完了から10分後に電源OFF候補を作成。
+    # 90分以内に次の測定がある場合は、次回更新時に自動取消する。
+    st.session_state.pending_power_off_due = (
+        now_jst + timedelta(minutes=10)
+    )
+
+    all_measurements_completed = all(
+        target in job['completed']
+        for target in job['targets']
+    )
+
+    if all_measurements_completed:
+        # 最終測定＝自動的に生産終了とはせず、作業者へ確認する。
+        st.session_state.pending_production_finish_confirmation = {
+            'machine': machine,
+            'job_id': job.get('job_id'),
+        }
+
+    return all_measurements_completed
+
+
+def undo_mfr_measurement(machine, target_qty):
+    """
+    誤って完了にした「始」「中」のMFR測定を未測定へ戻す。
+
+    完了記録だけでなく、その測定の通知確認履歴も取り消すため、
+    予定時刻・黄色◆・MFR電源ONバー・必要な測定アラートが
+    次回rerunで自動的に再計算される。
+    """
+    job = st.session_state.jobs.get(machine)
+    if job is None or target_qty not in job.get('targets', []):
+        return False
+
+    targets = list(job.get('targets', []))
+    if not targets:
+        return False
+
+    # 最終測定「終」は生産終了確認と連動するため、
+    # ワンタッチ取消の対象にはしない。
+    if target_qty == targets[-1]:
+        return False
+
+    if target_qty not in job.get('completed', []):
+        return False
+
+    job['completed'] = [
+        target for target in job['completed']
+        if target != target_qty
+    ]
+
+    # 通知から測定完了にした場合も、未測定へ戻した時点で
+    # 同じ測定の確認履歴を取り消し、必要なら再通知できるようにする。
+    job_id = job.get('job_id', machine)
+    measurement_alert_id = f"MEAS_{job_id}_{target_qty}"
+    st.session_state.acknowledged_alerts = [
+        alert_id
+        for alert_id in st.session_state.acknowledged_alerts
+        if str(alert_id) != measurement_alert_id
+    ]
+
+    # 誤完了によって作られた10分後のOFF予約を解除する。
+    # 未測定へ戻したポイントを含め、次回rerunで電源ON区間を再計算する。
+    st.session_state.pending_power_off_due = None
+
+    pending_finish = st.session_state.get(
+        'pending_production_finish_confirmation'
+    )
+    if (
+        pending_finish
+        and pending_finish.get('machine') == machine
+        and pending_finish.get('job_id') == job_id
+    ):
+        st.session_state.pending_production_finish_confirmation = None
+
+    return True
+
+
 on_blocks = []
 if valid_upcoming:
     current_start = valid_upcoming[0]['est_time'] - timedelta(minutes=60)
@@ -1350,6 +1523,8 @@ for pt in valid_upcoming:
                     f" 予定時刻：{m_time.strftime('%m/%d %H:%M')}"
                 ),
                 "kind": "measurement",
+                "machine": pt['machine'],
+                "target_qty": pt['target_qty'],
             })
 
 # 3. 電源ON・OFF
@@ -1466,10 +1641,10 @@ try:
 except:
     st.title("MFRスマート電源管理システム")
 
-st.write(f"現在時刻　**{now.strftime('%Y/%m/%d %H:%M')}**")
+st.caption(f"現在時刻　{now.strftime('%Y/%m/%d %H:%M')}")
 
-st.subheader("🔔 Edge通知・アラート音")
-
+# --- 上部ダッシュボード：通知 → MFR状態 → 成型機 の順に優先表示 ---
+st.markdown('<div class="top-section-title">🔔 通知</div>', unsafe_allow_html=True)
 render_monitor_activation()
 
 if active_alerts:
@@ -1496,11 +1671,23 @@ if active_alerts:
         unsafe_allow_html=True,
     )
 
+    if primary_alert["kind"] == "measurement":
+        ack_button_text = "✅ 測定完了（通知音を停止）"
+    else:
+        ack_button_text = "✅ 確認しました（通知音を停止）"
+
     if st.button(
-        "✅ 確認しました（通知音を停止）",
+        ack_button_text,
         key=f"ack_{primary_alert['id']}",
         type="primary",
     ):
+        if primary_alert["kind"] == "measurement":
+            # 測定通知の確認＝実際のMFR測定完了として同時に記録する。
+            complete_mfr_measurement(
+                primary_alert["machine"],
+                primary_alert["target_qty"],
+            )
+
         st.session_state.acknowledged_alerts.append(primary_alert["id"])
 
         if primary_alert["kind"] == "power_on":
@@ -1551,63 +1738,79 @@ else:
     st.success("✅ アラートなし")
 
 st.caption("※シフト開始時に青いボタンを1回押し、Edgeは開いたままにしてください。")
-st.markdown("---")
 
-# --- MFR電源ステータス ---
-st.header("💡 MFR電源・点検")
-is_monday = (today_date.weekday() == 0)
+st.markdown('<div class="top-section-title">💡 MFR状態</div>', unsafe_allow_html=True)
+status_col, inspection_col = st.columns([1.25, 1.0])
 
-inspection_start_time = datetime.combine(today_date, dt_time(8 if is_monday else 7, 0, 0))
-inspection_end_time = datetime.combine(today_date, dt_time(10, 0, 0))
+with status_col:
+    st.markdown("**MFR電源**")
 
-if st.session_state.last_inspection_date == today_date:
-    st.success("✅ 日常点検：完了")
-else:
-    if now >= inspection_start_time:
-        if is_monday:
-            st.error("📋 日常点検：未完了（8:00予定）")
+    if st.session_state.get('mfr_power_is_on', False):
+        st.error("🔥 電源 ON")
+    else:
+        st.success("💤 電源 OFF")
+
+    if not valid_upcoming:
+        st.caption("次回の測定予定なし")
+    else:
+        next_measure = valid_upcoming[0]
+        time_diff = next_measure['est_time'] - now
+        minutes_until = time_diff.total_seconds() / 60
+
+        if next_measure['target_qty'] == '日常点検':
+            meas_text = '日常点検'
         else:
-            st.error("📋 日常点検：未完了（7:00予定）")
-        if st.button("✅ 日常点検 完了"):
+            meas_text = (
+                f"{get_measurement_text(len(next_measure['Targets']), next_measure['target_qty'], next_measure['Targets'])}測定"
+            )
+
+        remaining_time_text = format_remaining_time(minutes_until)
+        next_label = f"{next_measure['machine']}・{meas_text}"
+
+        if minutes_until <= 60:
+            if st.session_state.get('mfr_power_is_on', False):
+                st.caption(
+                    f"次回 {next_label} まで {remaining_time_text}"
+                )
+            else:
+                st.warning(
+                    f"次の操作：電源ON　{next_label}"
+                )
+        elif minutes_until >= 90:
+            st.caption(
+                f"次回 {next_label} まで {remaining_time_text}"
+            )
+        else:
+            minutes_to_on = max(0, int(minutes_until - 60))
+            on_wait_text = format_remaining_time(minutes_to_on)
+            st.warning(f"約 {on_wait_text} 後に電源ON")
+
+with inspection_col:
+    st.markdown("**日常点検**")
+    is_monday = (today_date.weekday() == 0)
+    inspection_start_time = datetime.combine(
+        today_date,
+        dt_time(8 if is_monday else 7, 0, 0),
+    )
+
+    if st.session_state.last_inspection_date == today_date:
+        st.success("✅ 完了")
+    elif now >= inspection_start_time:
+        st.error(
+            f"📋 未完了（{inspection_start_time.strftime('%H:%M')}予定）"
+        )
+        if st.button("✅ 日常点検 完了", key="inspection_complete_top"):
             st.session_state.last_inspection_date = today_date
-            st.session_state.pending_power_off_due = now + timedelta(minutes=10)
+            st.session_state.pending_power_off_due = (
+                now + timedelta(minutes=10)
+            )
             save_state()
             st.rerun()
     else:
-        if is_monday:
-            st.warning("📋 日常点検：未実施（8:00開始）")
-        else:
-            st.warning("📋 日常点検：未実施（7:00開始）")
-
-st.markdown("---")
-
-if not valid_upcoming:
-    st.success("💤 **電源OFFで待機**　測定予定なし")
-else:
-    next_measure = valid_upcoming[0]
-    time_diff = next_measure['est_time'] - now
-    minutes_until = time_diff.total_seconds() / 60
-    
-    if next_measure['target_qty'] == '日常点検': meas_text = '日常点検'
-    else: meas_text = f"{get_measurement_text(len(next_measure['Targets']), next_measure['target_qty'], next_measure['Targets'])}の測定"
-
-    remaining_time_text = format_remaining_time(minutes_until)
-
-    if minutes_until <= 60:
-        st.error(
-            f"🔥 **電源ON**　次回まで {remaining_time_text} "
-            f"（{next_measure['machine']}・{meas_text}）"
-        )
-    elif minutes_until >= 90:
-        st.success(
-            f"💤 **電源OFFで待機**　次回まで {remaining_time_text}"
-        )
-    else:
-        minutes_to_on = max(0, int(minutes_until - 60))
-        on_wait_text = format_remaining_time(minutes_to_on)
         st.warning(
-            f"⏳ **電源OFFで待機**　約 {on_wait_text} 後にON"
+            f"📋 未実施（{inspection_start_time.strftime('%H:%M')}開始）"
         )
+
 st.markdown("---")
 
 
@@ -1742,6 +1945,66 @@ def finalize_production_start_with_actual_power(power_is_on):
     st.rerun()
 
 
+def finish_production(machine, job_id):
+    """最終測定後の確認で「はい」が選ばれた成型機を生産完了にする。"""
+    job = st.session_state.jobs.get(machine)
+    if job is None or job.get('job_id') != job_id:
+        st.session_state.pending_production_finish_confirmation = None
+        save_state()
+        return
+
+    job['status'] = 'Completed'
+    job['current_qty'] = job['total_qty']
+    job['production_ended_at'] = datetime.utcnow() + timedelta(hours=9)
+    st.session_state.pending_production_finish_confirmation = None
+    save_state()
+    st.rerun()
+
+
+def render_production_finish_confirmation_dialog():
+    """最終MFR測定完了後に、生産も終了したかを簡潔に確認する。"""
+    pending = st.session_state.get(
+        'pending_production_finish_confirmation'
+    )
+    if not pending:
+        return
+
+    machine = pending.get('machine')
+    job_id = pending.get('job_id')
+    job = st.session_state.jobs.get(machine)
+
+    # すでに別Lotへ切り替わっている場合は古い確認を破棄する。
+    if job is None or job.get('job_id') != job_id:
+        st.session_state.pending_production_finish_confirmation = None
+        save_state()
+        return
+
+    st.markdown("### 最後のMFR測定を完了しました")
+    st.caption(f"{machine} 成型機 ｜ {job.get('product_name', '')}")
+    st.write("この製品の生産も終了ですか？")
+
+    col_yes, col_no = st.columns(2)
+
+    with col_yes:
+        if st.button(
+            "✅ はい（生産終了）",
+            type="primary",
+            use_container_width=True,
+            key=f"finish_yes_{machine}_{job_id}",
+        ):
+            finish_production(machine, job_id)
+
+    with col_no:
+        if st.button(
+            "いいえ（生産継続）",
+            use_container_width=True,
+            key=f"finish_no_{machine}_{job_id}",
+        ):
+            st.session_state.pending_production_finish_confirmation = None
+            save_state()
+            st.rerun()
+
+
 def render_mfr_power_confirmation_dialog():
     """生産開始時に、実機MFRの現在の電源状態だけを簡潔に確認する。"""
     pending = st.session_state.get('pending_production_start')
@@ -1786,6 +2049,22 @@ def render_mfr_power_confirmation_dialog():
         st.rerun()
 
 
+# 最終測定後の生産終了確認ダイアログ。
+if hasattr(st, "dialog"):
+    show_production_finish_confirmation_dialog = st.dialog(
+        "🏁 生産終了の確認",
+        width="small",
+    )(render_production_finish_confirmation_dialog)
+elif hasattr(st, "experimental_dialog"):
+    show_production_finish_confirmation_dialog = st.experimental_dialog(
+        "🏁 生産終了の確認",
+    )(render_production_finish_confirmation_dialog)
+else:
+    show_production_finish_confirmation_dialog = (
+        render_production_finish_confirmation_dialog
+    )
+
+
 # Streamlitのバージョンに応じて正式ダイアログを使用。
 if hasattr(st, "dialog"):
     show_mfr_power_confirmation_dialog = st.dialog(
@@ -1803,11 +2082,14 @@ else:
     )
 
 
-if st.session_state.get('pending_production_start'):
+if st.session_state.get('pending_production_finish_confirmation'):
+    show_production_finish_confirmation_dialog()
+elif st.session_state.get('pending_production_start'):
     show_mfr_power_confirmation_dialog()
 
 
 # --- UI：成型機コントロールパネル ---
+st.markdown('<div class="top-section-title">🏭 成型機</div>', unsafe_allow_html=True)
 cols_top = st.columns(3)
 machine_data = {}
 
@@ -1818,6 +2100,11 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
         est_current = 0
         
         if job is None:
+            st.markdown(
+                '<div class="machine-status-badge machine-idle-badge">'
+                '● 停止中</div>',
+                unsafe_allow_html=True,
+            )
             # ★その成型機用に登録された製品だけを抽出（※機種設定がない古いデータは全成型機に表示してエラー回避）
             machine_products = [p_name for p_name, p_info in st.session_state.products.items() if p_info.get('machine', machine) == machine]
             
@@ -1872,13 +2159,26 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                     }
                     st.rerun()
         else:
-            status_color = "🟢" if job['status'] == 'Running' else ("🟡" if job['status'] == 'Paused' else "✅")
-            status_text = {
-                'Running': '稼働中',
-                'Paused': '一時停止',
-                'Completed': '完了',
-            }.get(job['status'], job['status'])
-            st.write(f"{status_color} **{status_text}**")
+            if job['status'] == 'Running':
+                st.markdown(
+                    '<div class="machine-status-badge machine-running-badge">'
+                    '<span class="machine-spin">⟳</span>'
+                    '<span>成型中</span></div>',
+                    unsafe_allow_html=True,
+                )
+            elif job['status'] == 'Paused':
+                st.markdown(
+                    '<div class="machine-status-badge machine-paused-badge">'
+                    '⏸ 一時停止</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="machine-status-badge machine-completed-badge">'
+                    '✅ 生産完了</div>',
+                    unsafe_allow_html=True,
+                )
+
             p_name = job.get('product_name', '設定なし')
             st.caption(
                 f"{p_name} ｜ {job['total_qty']}個 ｜ "
@@ -1904,35 +2204,58 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                             job['last_update'] = (datetime.utcnow() + timedelta(hours=9)); job['status'] = 'Running'; save_state(); st.rerun()
                 with col_ctrl2:
                     if st.button("⏹️ 生産終了", key=f"stop_main_{machine}"):
-                        st.session_state.jobs[machine] = None; save_state(); st.rerun()
+                        pending_finish = st.session_state.get(
+                            'pending_production_finish_confirmation'
+                        )
+                        if pending_finish and pending_finish.get('machine') == machine:
+                            st.session_state.pending_production_finish_confirmation = None
+                        st.session_state.jobs[machine] = None
+                        save_state()
+                        st.rerun()
 
             if job['status'] == 'Completed':
                 if st.button("🔄 次の製品の生産をセット", key=f"next_ok_{machine}"):
-                    st.session_state.jobs[machine] = None; save_state(); st.rerun()
+                    pending_finish = st.session_state.get(
+                        'pending_production_finish_confirmation'
+                    )
+                    if pending_finish and pending_finish.get('machine') == machine:
+                        st.session_state.pending_production_finish_confirmation = None
+                    st.session_state.jobs[machine] = None
+                    save_state()
+                    st.rerun()
 
             st.divider()
             st.markdown('<div class="mfr-status-header">📋 MFR測定</div>', unsafe_allow_html=True)
             num_targets = len(job['targets'])
+            final_target = job['targets'][-1] if job['targets'] else None
+
             for t in job['targets']:
                 meas_text = get_measurement_text(num_targets, t, job['targets'])
-                if t in job['completed']: st.write(f"✅ {meas_text}　完了")
+
+                if t in job['completed']:
+                    if t != final_target:
+                        # 「始」「中」は完了ボタンをもう一度押すと取消できる。
+                        if st.button(
+                            f"✅ {meas_text}　完了（押すと未測定へ戻す）",
+                            key=f"undo_comp_{machine}_{t}",
+                            use_container_width=True,
+                        ):
+                            if undo_mfr_measurement(machine, t):
+                                save_state()
+                                st.rerun()
+                    else:
+                        # 最終測定は生産終了確認と連動するため、
+                        # 誤操作防止のためワンタッチ取消にはしない。
+                        st.write(f"✅ {meas_text}　完了")
                 else:
-                    if st.button(f"🎯 {meas_text}　測定完了", key=f"comp_{machine}_{t}"):
-                        if job['status'] == 'Running':
-                            elapsed_sec = ((datetime.utcnow() + timedelta(hours=9)) - job['last_update']).total_seconds()
-                            job['current_qty'] = min(int(job['current_qty'] + (elapsed_sec / job['cycle_time'])), job['total_qty'])
-                            job['last_update'] = (datetime.utcnow() + timedelta(hours=9))
-                            
-                        job['completed'].append(t)
-                        # 実際の測定完了から10分後に電源OFF候補を作成。
-                        # 90分以内に次の測定がある場合は、次回更新時に自動取消します。
-                        st.session_state.pending_power_off_due = (
-                            datetime.utcnow() + timedelta(hours=9, minutes=10)
-                        )
-                        if len(job['completed']) == len(job['targets']): 
-                            job['status'] = 'Completed'
-                            job['current_qty'] = job['total_qty']
-                        save_state(); st.rerun()
+                    if st.button(
+                        f"🎯 {meas_text}　測定完了",
+                        key=f"comp_{machine}_{t}",
+                        use_container_width=True,
+                    ):
+                        complete_mfr_measurement(machine, t)
+                        save_state()
+                        st.rerun()
 
         machine_data[machine] = {'job': job, 'est_current': est_current}
 
@@ -2013,7 +2336,15 @@ measurement_points = []
 for machine, job in st.session_state.jobs.items():
     if job is None: continue
     start_time = job['last_update']
-    end_time = (datetime.utcnow() + timedelta(hours=9)) if job['status'] == 'Completed' else job['last_update'] + timedelta(seconds=(job['total_qty'] - job['current_qty']) * job['cycle_time'])
+    if job['status'] == 'Completed':
+        end_time = job.get(
+            'production_ended_at',
+            datetime.utcnow() + timedelta(hours=9),
+        )
+    else:
+        end_time = job['last_update'] + timedelta(
+            seconds=(job['total_qty'] - job['current_qty']) * job['cycle_time']
+        )
     timeline_data.append({'Task': machine, 'Start': start_time, 'End': end_time, 'Status': job['status'], 'Targets': job['targets']})
 
     for t in job['targets']:
