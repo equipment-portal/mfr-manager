@@ -1,3 +1,4 @@
+# Version 1.5.1: 運用ブラウザー表記をEdgeへ統一
 # Version 1.5.0: 親画面常駐エンジンで確認まで通知音を繰り返す
 # Version 1.4.9: 確認ボタン押下まで通知音を確実に繰り返す
 # Version 1.4.8: 通知欄の詳細表示を非表示・ボタン文言を固定
@@ -108,7 +109,7 @@ def get_image_base64(path):
     with open(path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode()
 
-# --- Chrome通知・チャイム音 ---
+# --- Edge通知・チャイム音 ---
 # 通知音は必ずこのプログラムと同じフォルダーから読み込みます。
 # 旧版の alert_chime.wav を誤って読み込まないよう、固有名を使用します。
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -273,7 +274,7 @@ def render_monitor_activation():
     始業時にクリックして、通知音とWindows通知を有効にする。
 
     通知音エンジンはStreamlitのiframe内ではなく、
-    親のChrome画面へscriptとして直接設置する。
+    親のEdge画面へscriptとして直接設置する。
     これにより10秒ごとの自動更新後も繰り返しタイマーを維持する。
     """
     sound_name_js = json.dumps(ALERT_SOUND_NAME, ensure_ascii=False)
@@ -724,7 +725,7 @@ def render_monitor_activation():
 
 def start_browser_alarm(alert_id, title, body):
     """
-    親のChrome画面に設置した通知音エンジンへ、
+    親のEdge画面に設置した通知音エンジンへ、
     確認されるまでの繰り返し再生を依頼する。
     """
     alert_id_json = json.dumps(alert_id, ensure_ascii=False)
@@ -1265,7 +1266,7 @@ except:
 
 st.write(f"現在時刻: **{now.strftime('%Y/%m/%d %H:%M:%S')}** (10秒ごとに自動更新中 🔄)")
 
-st.subheader("🔔 Chrome通知・警告音")
+st.subheader("🔔 Edge通知・警告音")
 
 render_monitor_activation()
 
@@ -1312,7 +1313,7 @@ else:
     stop_browser_alarm()
     st.success("✅ 現在、未確認の警告はありません。")
 
-st.caption("※シフト開始時に青いボタンを1回押してください。Chromeは閉じず、Excelの後ろで開いたままにします。")
+st.caption("※シフト開始時に青いボタンを1回押してください。Edgeは閉じず、Excelの後ろで開いたままにします。")
 st.markdown("---")
 
 # --- MFR電源ステータス ---
@@ -2197,4 +2198,3 @@ with st.expander(
         st.write(
             "稼働中のジョブを登録すると、ここに削減効果金額が表示されます。"
         )
-
