@@ -1,3 +1,4 @@
+# Version 1.5.9: 加熱中の電源ONアラート再発行を防止・550tの2回測定設定を維持
 # Version 1.5.7: 「▼ 現在」の三角位置を点線上へ修正
 # Version 1.5.6: タイムライン黄色測定マークを加熱60分後の予定時刻へ統一
 # Version 1.5.5: アラート経過時間を時間・分表示、監視開始後のボタン文言を簡略化
@@ -98,6 +99,26 @@ def load_state():
             pass
     return None
 
+def infer_mfr_power_state_from_alert_history(alert_ids):
+    """
+    V1.5.9より前の保存データからMFR電源状態を推定する。
+
+    確認履歴は押した順に保存されているため、
+    最後に確認した電源操作がONならTrue、OFFならFalseとする。
+    """
+    power_is_on = False
+
+    for alert_id in alert_ids or []:
+        alert_id_text = str(alert_id)
+
+        if alert_id_text.startswith("ON_"):
+            power_is_on = True
+        elif alert_id_text.startswith("OFF_ACTUAL_"):
+            power_is_on = False
+
+    return power_is_on
+
+
 def save_state():
     state_to_save = {
         'jobs': st.session_state.jobs,
@@ -106,7 +127,10 @@ def save_state():
         # 作業者が［確認しました］を押した通知だけを保存
         'acknowledged_alerts': st.session_state.acknowledged_alerts,
         # 実際に測定・点検が完了した10分後の電源OFF通知
-        'pending_power_off_due': st.session_state.pending_power_off_due
+        'pending_power_off_due': st.session_state.pending_power_off_due,
+        # 作業者が確認した実際のMFR電源状態。
+        # ON確認後は、OFF確認されるまで再度ONアラートを出さない。
+        'mfr_power_is_on': st.session_state.get('mfr_power_is_on', False)
     }
     with open(STATE_FILE, "wb") as f:
         pickle.dump(state_to_save, f)
@@ -1003,6 +1027,19 @@ if 'initialized' not in st.session_state:
         st.session_state.last_inspection_date = saved_state['last_inspection_date']
         st.session_state.acknowledged_alerts = saved_state.get('acknowledged_alerts', [])
         st.session_state.pending_power_off_due = saved_state.get('pending_power_off_due')
+
+        if 'mfr_power_is_on' in saved_state:
+            st.session_state.mfr_power_is_on = bool(
+                saved_state.get('mfr_power_is_on')
+            )
+        else:
+            # 旧版からの更新時は確認履歴から現在の電源状態を推定する。
+            st.session_state.mfr_power_is_on = (
+                infer_mfr_power_state_from_alert_history(
+                    st.session_state.acknowledged_alerts
+                )
+            )
+
         # ★GitHubのデータがあれば最優先、なければローカルデータ
         st.session_state.products = gh_products if gh_products is not None else saved_state.get('products', {})
     else:
@@ -1010,6 +1047,7 @@ if 'initialized' not in st.session_state:
         st.session_state.last_inspection_date = None
         st.session_state.acknowledged_alerts = []
         st.session_state.pending_power_off_due = None
+        st.session_state.mfr_power_is_on = False
         default_products = {
             'サンプル製品A': {'machine': '100t', 'qty': 500, 'cycle': 60.0, 'measurements': 2},
             'サンプル製品B': {'machine': '450t', 'qty': 1000, 'cycle': 30.0, 'measurements': 3}
@@ -1056,6 +1094,12 @@ if 'acknowledged_alerts' not in st.session_state:
     st.session_state.acknowledged_alerts = []
 if 'pending_power_off_due' not in st.session_state:
     st.session_state.pending_power_off_due = None
+if 'mfr_power_is_on' not in st.session_state:
+    st.session_state.mfr_power_is_on = (
+        infer_mfr_power_state_from_alert_history(
+            st.session_state.acknowledged_alerts
+        )
+    )
 
 # --- UI：サイドバー ---
 with st.sidebar:
@@ -1124,6 +1168,7 @@ with st.sidebar:
     if st.button("🔄 すべての成型機の状態をリセット"):
         st.session_state.jobs = {'100t': None, '450t': None, '550t': None}
         st.session_state.pending_power_off_due = None
+        st.session_state.mfr_power_is_on = False
         save_state(); st.rerun()
         
     if st.button("🔄 今日の点検状態を未実施に戻す"):
@@ -1131,6 +1176,7 @@ with st.sidebar:
         save_state(); st.rerun()
 
     if st.button("🔕 通知の確認履歴をリセット（テスト用）"):
+        # 履歴だけをリセットし、現在の実機電源状態記録は変更しない。
         st.session_state.acknowledged_alerts = []
         save_state(); st.rerun()
 
@@ -1285,18 +1331,38 @@ for b_start, b_off in on_blocks:
     ]
     target_machine = target_tasks[0] if target_tasks else "成型機"
 
-    # 対象作業が未完了なら、電源ON予定を過ぎてもアラートを維持する。
-    if b_start <= now:
+    # 電源ON予定を過ぎても未確認ならアラートを維持する。
+    # ただし、一度ON操作を確認して実機が加熱中である間は、
+    # 残り予定からon_blocksが再計算されてもONアラートを再発行しない。
+    if b_start <= now and not st.session_state.mfr_power_is_on:
         alert_id_on = f"ON_{b_start.strftime('%Y%m%d_%H%M')}"
         if alert_id_on not in st.session_state.acknowledged_alerts:
-            first_measure_time = b_start + timedelta(minutes=60)
+            block_measurements = [
+                x for x in valid_upcoming
+                if (
+                    x['est_time'] is not None
+                    and b_start <= x['est_time'] <= b_off
+                )
+            ]
+
+            if block_measurements:
+                first_measure = min(
+                    block_measurements,
+                    key=lambda item: item['est_time'],
+                )
+                first_measure_time = first_measure['est_time']
+                target_machine = first_measure['machine']
+            else:
+                first_measure_time = b_start + timedelta(minutes=60)
+
             active_alerts.append({
                 "id": alert_id_on,
                 "due": b_start,
                 "title": "🔥 MFR電源ONアラート",
                 "message": (
                     f"MFR測定器の電源をONにしてください。"
-                    f" 対象：{target_machine}／最初の予定：{first_measure_time.strftime('%m/%d %H:%M')}"
+                    f" 対象：{target_machine}／"
+                    f"最初の予定：{first_measure_time.strftime('%m/%d %H:%M')}"
                 ),
                 "kind": "power_on",
             })
@@ -1382,8 +1448,16 @@ if active_alerts:
         type="primary",
     ):
         st.session_state.acknowledged_alerts.append(primary_alert["id"])
-        if primary_alert["kind"] == "power_off":
+
+        if primary_alert["kind"] == "power_on":
+            # 作業者が実際にMFR電源をONにしたことを記録。
+            st.session_state.mfr_power_is_on = True
+
+        elif primary_alert["kind"] == "power_off":
+            # 作業者が実際にMFR電源をOFFにしたことを記録。
+            st.session_state.mfr_power_is_on = False
             st.session_state.pending_power_off_due = None
+
         save_state()
         stop_browser_alarm()
         st.rerun()
