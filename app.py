@@ -1,3 +1,6 @@
+# Version 1.5.4: 初回MFR測定を加熱60分後へ修正・通知タイミング再確認
+# Version 1.5.3: 次回測定までの残り時間を時間・分表示へ変更
+# Version 1.5.2: UI表記をアラート／通知へ統一
 # Version 1.5.1: 運用ブラウザー表記をEdgeへ統一
 # Version 1.5.0: 親画面常駐エンジンで確認まで通知音を繰り返す
 # Version 1.4.9: 確認ボタン押下まで通知音を確実に繰り返す
@@ -123,6 +126,9 @@ ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_5_0"
 # 未確認中のWindows通知を再表示する間隔。
 # Excelを前面で使用していても気づきやすいよう、30秒ごとに再通知します。
 WINDOWS_NOTIFICATION_REPEAT_MS = 30_000
+
+# 生産スタート時をMFR加熱開始時刻とし、初回測定は60分後以降にする。
+MFR_WARMUP_MINUTES = 60
 
 
 def _build_chime_wav() -> bytes:
@@ -508,7 +514,7 @@ def render_monitor_activation():
       }
     };
 
-    // 警告発生時に直ちに1回鳴らす。
+    // アラート発生時に直ちに1回鳴らす。
     await playIfActive();
 
     // 確認ボタンを押すまで4.2秒ごとに繰り返す。
@@ -553,8 +559,8 @@ def render_monitor_activation():
         "mfr_alarm_loop_enabled"
       ) === "1";
 
-    // 既に警告が出ている状態で監視開始を押した場合は、
-    // テスト音の後から警告音ループを再開する。
+    // 既にアラートが出ている状態で監視開始を押した場合は、
+    // テスト音の後からアラート音ループを再開する。
     if (loopEnabled && activeAlertId) {
       w.setTimeout(() => {
         startLoop(activeAlertId);
@@ -906,6 +912,19 @@ def get_measurement_text(num_targets, current_target_qty, targets):
         if current_target_qty == targets[2]: return '終'
     return str(current_target_qty)
 
+
+def format_remaining_time(minutes):
+    """残り時間を読みやすい「○時間○分」形式へ変換する。"""
+    total_minutes = max(0, int(minutes))
+    hours, mins = divmod(total_minutes, 60)
+
+    if hours > 0 and mins > 0:
+        return f"{hours}時間{mins}分"
+    if hours > 0:
+        return f"{hours}時間"
+    return f"{mins}分"
+
+
 # --- CSS設定 ---
 st.markdown(
     """
@@ -995,11 +1014,35 @@ if 'initialized' not in st.session_state:
         
     # 既存保存データにも安定したジョブIDを追加（通知IDが毎回変わるのを防止）
     for machine_name, saved_job in st.session_state.jobs.items():
-        if saved_job is not None and not saved_job.get('job_id'):
-            anchor = saved_job.get('last_update', datetime.utcnow() + timedelta(hours=9))
+        if saved_job is None:
+            continue
+
+        if not saved_job.get('job_id'):
+            anchor = saved_job.get(
+                'last_update',
+                datetime.utcnow() + timedelta(hours=9)
+            )
             if not isinstance(anchor, datetime):
                 anchor = datetime.utcnow() + timedelta(hours=9)
-            saved_job['job_id'] = f"{machine_name}_{anchor.strftime('%Y%m%d%H%M%S')}"
+            saved_job['job_id'] = (
+                f"{machine_name}_{anchor.strftime('%Y%m%d%H%M%S')}"
+            )
+
+        # V1.5.4以前に開始した生産データにも加熱60分条件を補完する。
+        # まだMFR測定を1回も完了していないLotだけを対象にする。
+        if 'heat_ready_at' not in saved_job:
+            if not saved_job.get('completed'):
+                heat_anchor = saved_job.get('last_update')
+                if not isinstance(heat_anchor, datetime):
+                    heat_anchor = datetime.utcnow() + timedelta(hours=9)
+
+                saved_job['heat_ready_at'] = (
+                    heat_anchor
+                    + timedelta(minutes=MFR_WARMUP_MINUTES)
+                )
+            else:
+                # 「始」測定済みなら初回加熱待ちは不要。
+                saved_job['heat_ready_at'] = None
 
     st.session_state.initialized = True
     st.session_state.inspection_dialog_shown = False
@@ -1101,8 +1144,27 @@ def calculate_upcoming_measurements():
             if target not in job['completed']:
                 if job['status'] == 'Running':
                     remaining_qty = target - job['current_qty']
-                    if remaining_qty <= 0: est_time = job['last_update']
-                    else: est_time = job['last_update'] + timedelta(seconds=remaining_qty * job['cycle_time'])
+
+                    if remaining_qty <= 0:
+                        est_time = job['last_update']
+                    else:
+                        est_time = (
+                            job['last_update']
+                            + timedelta(
+                                seconds=remaining_qty * job['cycle_time']
+                            )
+                        )
+
+                    # 生産スタート直後の「始」測定が1個目のサイクルで
+                    # すぐ到来しても、MFR加熱60分が終わるまでは
+                    # 測定予定時刻にしない。
+                    heat_ready_at = job.get('heat_ready_at')
+                    if (
+                        isinstance(heat_ready_at, datetime)
+                        and est_time < heat_ready_at
+                    ):
+                        est_time = heat_ready_at
+
                 elif job['status'] == 'Paused':
                     est_time = None 
                 
@@ -1168,7 +1230,7 @@ if st.session_state.last_inspection_date != today_date and now >= inspection_sta
             "kind": "inspection",
         })
 
-# 2. MFR測定（予定時刻から15分を過ぎても、確認されるまで警告を継続）
+# 2. MFR測定（予定時刻になったら、確認されるまでアラートを継続）
 for pt in valid_upcoming:
     if pt['machine'] == '日常点検(A勤)':
         continue
@@ -1204,7 +1266,8 @@ for b_start, b_off in on_blocks:
     ]
     target_machine = target_tasks[0] if target_tasks else "成型機"
 
-    if b_start <= now < b_off:
+    # 対象作業が未完了なら、電源ON予定を過ぎてもアラートを維持する。
+    if b_start <= now:
         alert_id_on = f"ON_{b_start.strftime('%Y%m%d_%H%M')}"
         if alert_id_on not in st.session_state.acknowledged_alerts:
             first_measure_time = b_start + timedelta(minutes=60)
@@ -1266,7 +1329,7 @@ except:
 
 st.write(f"現在時刻: **{now.strftime('%Y/%m/%d %H:%M:%S')}** (10秒ごとに自動更新中 🔄)")
 
-st.subheader("🔔 Edge通知・警告音")
+st.subheader("🔔 Edge通知・アラート音")
 
 render_monitor_activation()
 
@@ -1311,7 +1374,7 @@ if active_alerts:
                 )
 else:
     stop_browser_alarm()
-    st.success("✅ 現在、未確認の警告はありません。")
+    st.success("✅ 現在、未確認のアラートはありません。")
 
 st.caption("※シフト開始時に青いボタンを1回押してください。Edgeは閉じず、Excelの後ろで開いたままにします。")
 st.markdown("---")
@@ -1354,9 +1417,26 @@ else:
     if next_measure['target_qty'] == '日常点検': meas_text = '日常点検'
     else: meas_text = f"{get_measurement_text(len(next_measure['Targets']), next_measure['target_qty'], next_measure['Targets'])}の測定"
 
-    if minutes_until <= 60: st.error(f"🔥 **電源ON（加熱開始・維持）** \n\n次回の測定まで約 {max(0, int(minutes_until))} 分です。 ({next_measure['machine']}の{meas_text})")
-    elif minutes_until >= 90: st.success(f"💤 **電源OFF推奨（待機）** \n\n次回の測定まで約 {int(minutes_until)} 分あります。ゆっくり冷まして設備負担を軽減してください。")
-    else: st.warning(f"⚠️ **まもなくON（待機）** \n\n次回の測定まで約 {int(minutes_until)} 分です。現在はOFFのままで問題ありません。")
+    remaining_time_text = format_remaining_time(minutes_until)
+
+    if minutes_until <= 60:
+        st.error(
+            f"🔥 **電源ON（加熱開始・維持）** "
+            f"\n\n次回の測定まで約 {remaining_time_text} です。 "
+            f"({next_measure['machine']}の{meas_text})"
+        )
+    elif minutes_until >= 90:
+        st.success(
+            f"💤 **電源OFF推奨（待機）** "
+            f"\n\n次回の測定まで約 {remaining_time_text} あります。"
+            "ゆっくり冷まして設備負担を軽減してください。"
+        )
+    else:
+        st.warning(
+            f"⚠️ **まもなくON（待機）** "
+            f"\n\n次回の測定まで約 {remaining_time_text} です。"
+            "現在はOFFのままで問題ありません。"
+        )
 st.markdown("---")
 
 # --- UI：成型機コントロールパネル ---
@@ -1394,9 +1474,20 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                     start_timestamp = datetime.utcnow() + timedelta(hours=9)
                     st.session_state.jobs[machine] = {
                         'job_id': f"{machine}_{start_timestamp.strftime('%Y%m%d%H%M%S')}",
-                        'product_name': product_name, 'total_qty': total_qty, 'cycle_time': cycle_time,
-                        'current_qty': current_qty, 'last_update': start_timestamp,
-                        'targets': targets, 'completed': completed, 'status': 'Running'
+                        'product_name': product_name,
+                        'total_qty': total_qty,
+                        'cycle_time': cycle_time,
+                        'current_qty': current_qty,
+                        'last_update': start_timestamp,
+                        # 生産スタート＝MFR加熱開始。
+                        # 初回MFR測定は必ず60分後以降。
+                        'heat_ready_at': (
+                            start_timestamp
+                            + timedelta(minutes=MFR_WARMUP_MINUTES)
+                        ),
+                        'targets': targets,
+                        'completed': completed,
+                        'status': 'Running'
                     }
                     save_state(); st.rerun()
         else:
