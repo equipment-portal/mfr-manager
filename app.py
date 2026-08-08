@@ -1,3 +1,5 @@
+# Version 1.6.1: 生産開始時に実機MFR電源ON/OFF確認ダイアログを追加
+# Version 1.6.0: 新規生産時のONアラート欠落を修正・ON状態管理とアラートIDを再設計
 # Version 1.5.9: 加熱中の電源ONアラート再発行を防止・550tの2回測定設定を維持
 # Version 1.5.7: 「▼ 現在」の三角位置を点線上へ修正
 # Version 1.5.6: タイムライン黄色測定マークを加熱60分後の予定時刻へ統一
@@ -130,7 +132,12 @@ def save_state():
         'pending_power_off_due': st.session_state.pending_power_off_due,
         # 作業者が確認した実際のMFR電源状態。
         # ON確認後は、OFF確認されるまで再度ONアラートを出さない。
-        'mfr_power_is_on': st.session_state.get('mfr_power_is_on', False)
+        'mfr_power_is_on': st.session_state.get('mfr_power_is_on', False),
+        'mfr_power_on_confirmed_at': st.session_state.get(
+            'mfr_power_on_confirmed_at'
+        ),
+        # V1.6.0以降の電源状態管理。
+        'mfr_power_state_version': 2
     }
     with open(STATE_FILE, "wb") as f:
         pickle.dump(state_to_save, f)
@@ -1028,17 +1035,23 @@ if 'initialized' not in st.session_state:
         st.session_state.acknowledged_alerts = saved_state.get('acknowledged_alerts', [])
         st.session_state.pending_power_off_due = saved_state.get('pending_power_off_due')
 
-        if 'mfr_power_is_on' in saved_state:
+        power_state_version = int(
+            saved_state.get('mfr_power_state_version', 0)
+        )
+
+        if power_state_version >= 2:
             st.session_state.mfr_power_is_on = bool(
-                saved_state.get('mfr_power_is_on')
+                saved_state.get('mfr_power_is_on', False)
+            )
+            st.session_state.mfr_power_on_confirmed_at = (
+                saved_state.get('mfr_power_on_confirmed_at')
             )
         else:
-            # 旧版からの更新時は確認履歴から現在の電源状態を推定する。
-            st.session_state.mfr_power_is_on = (
-                infer_mfr_power_state_from_alert_history(
-                    st.session_state.acknowledged_alerts
-                )
-            )
+            # V1.5.9以前は確認履歴からON状態を推定していたため、
+            # 過去のON確認が新しい生産を誤って抑止する可能性がある。
+            # V1.6.0への初回移行時は安全側でOFFとして判定し直す。
+            st.session_state.mfr_power_is_on = False
+            st.session_state.mfr_power_on_confirmed_at = None
 
         # ★GitHubのデータがあれば最優先、なければローカルデータ
         st.session_state.products = gh_products if gh_products is not None else saved_state.get('products', {})
@@ -1048,6 +1061,7 @@ if 'initialized' not in st.session_state:
         st.session_state.acknowledged_alerts = []
         st.session_state.pending_power_off_due = None
         st.session_state.mfr_power_is_on = False
+        st.session_state.mfr_power_on_confirmed_at = None
         default_products = {
             'サンプル製品A': {'machine': '100t', 'qty': 500, 'cycle': 60.0, 'measurements': 2},
             'サンプル製品B': {'machine': '450t', 'qty': 1000, 'cycle': 30.0, 'measurements': 3}
@@ -1095,11 +1109,11 @@ if 'acknowledged_alerts' not in st.session_state:
 if 'pending_power_off_due' not in st.session_state:
     st.session_state.pending_power_off_due = None
 if 'mfr_power_is_on' not in st.session_state:
-    st.session_state.mfr_power_is_on = (
-        infer_mfr_power_state_from_alert_history(
-            st.session_state.acknowledged_alerts
-        )
-    )
+    st.session_state.mfr_power_is_on = False
+if 'mfr_power_on_confirmed_at' not in st.session_state:
+    st.session_state.mfr_power_on_confirmed_at = None
+if 'pending_production_start' not in st.session_state:
+    st.session_state.pending_production_start = None
 
 # --- UI：サイドバー ---
 with st.sidebar:
@@ -1169,6 +1183,8 @@ with st.sidebar:
         st.session_state.jobs = {'100t': None, '450t': None, '550t': None}
         st.session_state.pending_power_off_due = None
         st.session_state.mfr_power_is_on = False
+        st.session_state.mfr_power_on_confirmed_at = None
+        st.session_state.pending_production_start = None
         save_state(); st.rerun()
         
     if st.button("🔄 今日の点検状態を未実施に戻す"):
@@ -1195,17 +1211,28 @@ def calculate_planned_measurement_time(job, target):
     if job is None or job.get('status') != 'Running':
         return None
 
-    remaining_qty = target - job['current_qty']
+    # 実機MFRがすでに加熱済みの状態でゼロから生産開始した場合は、
+    # 「始」測定を生産開始直後に実施できる。
+    first_measure_due_at = job.get('first_measure_due_at')
+    first_target = job['targets'][0] if job.get('targets') else None
 
-    if remaining_qty <= 0:
-        est_time = job['last_update']
+    if (
+        target == first_target
+        and isinstance(first_measure_due_at, datetime)
+    ):
+        est_time = first_measure_due_at
     else:
-        est_time = (
-            job['last_update']
-            + timedelta(
-                seconds=remaining_qty * job['cycle_time']
+        remaining_qty = target - job['current_qty']
+
+        if remaining_qty <= 0:
+            est_time = job['last_update']
+        else:
+            est_time = (
+                job['last_update']
+                + timedelta(
+                    seconds=remaining_qty * job['cycle_time']
+                )
             )
-        )
 
     heat_ready_at = job.get('heat_ready_at')
     if (
@@ -1335,26 +1362,50 @@ for b_start, b_off in on_blocks:
     # ただし、一度ON操作を確認して実機が加熱中である間は、
     # 残り予定からon_blocksが再計算されてもONアラートを再発行しない。
     if b_start <= now and not st.session_state.mfr_power_is_on:
-        alert_id_on = f"ON_{b_start.strftime('%Y%m%d_%H%M')}"
-        if alert_id_on not in st.session_state.acknowledged_alerts:
-            block_measurements = [
-                x for x in valid_upcoming
-                if (
-                    x['est_time'] is not None
-                    and b_start <= x['est_time'] <= b_off
-                )
-            ]
+        block_measurements = [
+            x for x in valid_upcoming
+            if (
+                x['est_time'] is not None
+                and b_start <= x['est_time'] <= b_off
+            )
+        ]
 
-            if block_measurements:
-                first_measure = min(
-                    block_measurements,
-                    key=lambda item: item['est_time'],
+        if block_measurements:
+            first_measure = min(
+                block_measurements,
+                key=lambda item: item['est_time'],
+            )
+            first_measure_time = first_measure['est_time']
+            target_machine = first_measure['machine']
+
+            if target_machine == '日常点検(A勤)':
+                on_context = (
+                    f"INSP_"
+                    f"{first_measure_time.strftime('%Y%m%d_%H%M')}"
                 )
-                first_measure_time = first_measure['est_time']
-                target_machine = first_measure['machine']
             else:
-                first_measure_time = b_start + timedelta(minutes=60)
+                first_job = st.session_state.jobs.get(target_machine)
+                first_job_id = (
+                    first_job.get('job_id', target_machine)
+                    if first_job is not None
+                    else target_machine
+                )
+                on_context = (
+                    f"{first_job_id}_"
+                    f"{first_measure['target_qty']}"
+                )
+        else:
+            first_measure_time = b_start + timedelta(minutes=60)
+            on_context = b_start.strftime('%Y%m%d_%H%M%S')
 
+        # 同じ時刻の過去テスト履歴と衝突しないよう、
+        # Lot/測定ポイントを含む固有IDにする。
+        alert_id_on = (
+            f"ON_{on_context}_"
+            f"{b_start.strftime('%Y%m%d_%H%M%S')}"
+        )
+
+        if alert_id_on not in st.session_state.acknowledged_alerts:
             active_alerts.append({
                 "id": alert_id_on,
                 "due": b_start,
@@ -1450,12 +1501,35 @@ if active_alerts:
         st.session_state.acknowledged_alerts.append(primary_alert["id"])
 
         if primary_alert["kind"] == "power_on":
-            # 作業者が実際にMFR電源をONにしたことを記録。
+            # 作業者が実際にMFR電源をONにした時点を、加熱開始時刻として記録。
+            power_on_confirmed_at = (
+                datetime.utcnow() + timedelta(hours=9)
+            )
             st.session_state.mfr_power_is_on = True
+            st.session_state.mfr_power_on_confirmed_at = (
+                power_on_confirmed_at
+            )
+
+            # 「実機OFF」と確認していたLotは、実際にON操作を確認した
+            # この時点から60分後を測定可能時刻として数え直す。
+            ready_at = (
+                power_on_confirmed_at
+                + timedelta(minutes=MFR_WARMUP_MINUTES)
+            )
+            for waiting_job in st.session_state.jobs.values():
+                if (
+                    waiting_job is not None
+                    and waiting_job.get('status') in ('Running', 'Paused')
+                    and waiting_job.get('waiting_for_mfr_power_on', False)
+                ):
+                    waiting_job['heat_ready_at'] = ready_at
+                    waiting_job['waiting_for_mfr_power_on'] = False
+                    waiting_job['first_measure_due_at'] = None
 
         elif primary_alert["kind"] == "power_off":
             # 作業者が実際にMFR電源をOFFにしたことを記録。
             st.session_state.mfr_power_is_on = False
+            st.session_state.mfr_power_on_confirmed_at = None
             st.session_state.pending_power_off_due = None
 
         save_state()
@@ -1536,6 +1610,263 @@ else:
         )
 st.markdown("---")
 
+
+def finalize_production_start_with_actual_power(power_is_on):
+    """
+    生産開始時に作業者が目視確認した実機MFR電源状態を正として、
+    PC側の電源状態と測定予定を同期する。
+    """
+    pending = st.session_state.get('pending_production_start')
+    if not pending:
+        return
+
+    now_jst = datetime.utcnow() + timedelta(hours=9)
+    start_timestamp = pending['start_timestamp']
+    machine = pending['machine']
+    current_qty = int(pending['current_qty'])
+    targets = list(pending['targets'])
+    completed = list(pending['completed'])
+
+    previous_power_is_on = bool(
+        st.session_state.get('mfr_power_is_on', False)
+    )
+    previous_power_on_at = st.session_state.get(
+        'mfr_power_on_confirmed_at'
+    )
+
+    first_measure_due_at = None
+
+    if power_is_on:
+        # 実機ONを最優先する。
+        st.session_state.mfr_power_is_on = True
+
+        if (
+            previous_power_is_on
+            and isinstance(previous_power_on_at, datetime)
+        ):
+            # 別の成形機ですでにONしている場合は、
+            # その加熱開始時刻をそのまま引き継ぐ。
+            power_on_at = previous_power_on_at
+            heat_ready_at = (
+                power_on_at
+                + timedelta(minutes=MFR_WARMUP_MINUTES)
+            )
+        else:
+            # PC記録と不一致で「実機はON」と回答された場合は、
+            # 作業者の実機確認を優先し、すでに測定可能なON状態として扱う。
+            # これによりゼロ開始なら「始」測定をすぐ実施できる。
+            power_on_at = (
+                now_jst
+                - timedelta(minutes=MFR_WARMUP_MINUTES)
+            )
+            heat_ready_at = now_jst
+
+            # 他の稼働中Lotも、実機が加熱済みであるという
+            # 作業者確認に同期する。
+            for active_job in st.session_state.jobs.values():
+                if (
+                    active_job is not None
+                    and active_job.get('status') in ('Running', 'Paused')
+                ):
+                    active_job['heat_ready_at'] = now_jst
+                    active_job['waiting_for_mfr_power_on'] = False
+                    active_job['first_measure_due_at'] = None
+
+        st.session_state.mfr_power_on_confirmed_at = power_on_at
+
+        # 既存ON時刻から60分未満なら、残り加熱時間を引き継ぐ。
+        # 60分以上加熱済み＋ゼロ開始なら、「始」は即時測定。
+        if heat_ready_at <= now_jst:
+            heat_ready_at = now_jst
+            if (
+                current_qty == 0
+                and targets
+                and targets[0] not in completed
+            ):
+                first_measure_due_at = start_timestamp
+
+        waiting_for_mfr_power_on = False
+
+    else:
+        # 実機OFFを最優先する。
+        st.session_state.mfr_power_is_on = False
+        st.session_state.mfr_power_on_confirmed_at = None
+
+        # 過去のON確認履歴によって新しいONアラートが抑止されないよう、
+        # ON系の確認履歴だけを破棄する。
+        st.session_state.acknowledged_alerts = [
+            alert_id
+            for alert_id in st.session_state.acknowledged_alerts
+            if not str(alert_id).startswith("ON_")
+        ]
+
+        # この時点ではまだ実際のON操作をしていないため、
+        # 暫定的に60分後を測定可能時刻とする。
+        # ONアラート確認時に「実際にONした時刻＋60分」へ再補正する。
+        heat_ready_at = (
+            now_jst + timedelta(minutes=MFR_WARMUP_MINUTES)
+        )
+        waiting_for_mfr_power_on = True
+
+        # MFRが実際にOFFなら、他の稼働中Lotも同じ測定器を使えない。
+        # すべての未完了Lotを加熱待ち状態へ同期する。
+        for active_job in st.session_state.jobs.values():
+            if (
+                active_job is not None
+                and active_job.get('status') in ('Running', 'Paused')
+            ):
+                active_job['heat_ready_at'] = heat_ready_at
+                active_job['waiting_for_mfr_power_on'] = True
+                active_job['first_measure_due_at'] = None
+
+    st.session_state.jobs[machine] = {
+        'job_id': (
+            f"{machine}_"
+            f"{start_timestamp.strftime('%Y%m%d%H%M%S')}"
+        ),
+        'product_name': pending['product_name'],
+        'total_qty': pending['total_qty'],
+        'cycle_time': pending['cycle_time'],
+        'current_qty': current_qty,
+        'last_update': start_timestamp,
+        'heat_ready_at': heat_ready_at,
+        'waiting_for_mfr_power_on': waiting_for_mfr_power_on,
+        'first_measure_due_at': first_measure_due_at,
+        'targets': targets,
+        'completed': completed,
+        'status': 'Running',
+    }
+
+    st.session_state.pending_production_start = None
+    save_state()
+    st.rerun()
+
+
+def render_mfr_power_confirmation_dialog():
+    pending = st.session_state.get('pending_production_start')
+    if not pending:
+        return
+
+    machine = pending['machine']
+    product_name = pending['product_name']
+
+    active_other_machines = [
+        machine_name
+        for machine_name, job in st.session_state.jobs.items()
+        if (
+            machine_name != machine
+            and job is not None
+            and job.get('status') in ('Running', 'Paused')
+        )
+    ]
+
+    st.markdown(
+        f"### {machine} 成型機 ／ {product_name}"
+    )
+    st.warning(
+        "生産開始前に、実機のMFR測定器を目視確認してください。"
+        "PC上の記録ではなく、実際の電源状態を選択します。"
+    )
+
+    pc_power_text = (
+        "ON"
+        if st.session_state.get('mfr_power_is_on', False)
+        else "OFF"
+    )
+
+    if (
+        st.session_state.get('mfr_power_is_on', False)
+        and isinstance(
+            st.session_state.get('mfr_power_on_confirmed_at'),
+            datetime,
+        )
+    ):
+        elapsed_min = max(
+            0,
+            int(
+                (
+                    (datetime.utcnow() + timedelta(hours=9))
+                    - st.session_state.mfr_power_on_confirmed_at
+                ).total_seconds()
+                // 60
+            ),
+        )
+        pc_power_text += (
+            f"（ON確認から {format_remaining_time(elapsed_min)}）"
+        )
+
+    st.caption(
+        f"PC上の記録：{pc_power_text}　"
+        "※不一致の場合は実機の状態を優先します。"
+    )
+
+    if active_other_machines:
+        st.info(
+            "他の成型機も稼働中です："
+            + "、".join(active_other_machines)
+            + "。実機がすでにONなら、ONを選ぶことで"
+            "重複した電源ONアラートは出しません。"
+        )
+
+    st.markdown(
+        "**ONを選択：** 既存の加熱状態を引き継ぎます。"
+        "すでに60分以上加熱済みでゼロから生産開始する場合は、"
+        "「始」のMFR測定をすぐ開始できます。"
+    )
+    st.markdown(
+        "**OFFを選択：** 電源ONアラートから開始し、"
+        "実際にON操作を確認した時点から60分加熱します。"
+    )
+
+    col_on, col_off = st.columns(2)
+
+    with col_on:
+        if st.button(
+            "🟢 MFR電源はONです",
+            type="primary",
+            use_container_width=True,
+            key="confirm_mfr_power_on",
+        ):
+            finalize_production_start_with_actual_power(True)
+
+    with col_off:
+        if st.button(
+            "⚫ MFR電源はOFFです",
+            use_container_width=True,
+            key="confirm_mfr_power_off",
+        ):
+            finalize_production_start_with_actual_power(False)
+
+    if st.button(
+        "キャンセル",
+        use_container_width=True,
+        key="cancel_pending_production_start",
+    ):
+        st.session_state.pending_production_start = None
+        st.rerun()
+
+
+# Streamlitのバージョンに応じて正式ダイアログを使用。
+if hasattr(st, "dialog"):
+    show_mfr_power_confirmation_dialog = st.dialog(
+        "🔌 MFR電源状態の確認",
+        width="large",
+    )(render_mfr_power_confirmation_dialog)
+elif hasattr(st, "experimental_dialog"):
+    show_mfr_power_confirmation_dialog = st.experimental_dialog(
+        "🔌 MFR電源状態の確認",
+    )(render_mfr_power_confirmation_dialog)
+else:
+    # 古いStreamlitでは通常表示へフォールバック。
+    show_mfr_power_confirmation_dialog = (
+        render_mfr_power_confirmation_dialog
+    )
+
+
+if st.session_state.get('pending_production_start'):
+    show_mfr_power_confirmation_dialog()
+
+
 # --- UI：成型機コントロールパネル ---
 cols_top = st.columns(3)
 machine_data = {}
@@ -1568,25 +1899,20 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 completed = st.multiselect("既に測定済みのポイント", options=targets, default=default_completed, format_func=lambda x: f"{x}個目", key=f"comp_sel_{machine}")
 
                 if st.button("▶️ 生産スタート", key=f"start_btn_{machine}"):
-                    start_timestamp = datetime.utcnow() + timedelta(hours=9)
-                    st.session_state.jobs[machine] = {
-                        'job_id': f"{machine}_{start_timestamp.strftime('%Y%m%d%H%M%S')}",
+                    # 実際のMFR電源状態を確認してからジョブを確定する。
+                    st.session_state.pending_production_start = {
+                        'machine': machine,
                         'product_name': product_name,
                         'total_qty': total_qty,
                         'cycle_time': cycle_time,
                         'current_qty': current_qty,
-                        'last_update': start_timestamp,
-                        # 生産スタート＝MFR加熱開始。
-                        # 初回MFR測定は必ず60分後以降。
-                        'heat_ready_at': (
-                            start_timestamp
-                            + timedelta(minutes=MFR_WARMUP_MINUTES)
+                        'targets': list(targets),
+                        'completed': list(completed),
+                        'start_timestamp': (
+                            datetime.utcnow() + timedelta(hours=9)
                         ),
-                        'targets': targets,
-                        'completed': completed,
-                        'status': 'Running'
                     }
-                    save_state(); st.rerun()
+                    st.rerun()
         else:
             status_color = "🟢" if job['status'] == 'Running' else ("🟡" if job['status'] == 'Paused' else "✅")
             st.write(f"状態: {status_color} **{job['status']}**")
