@@ -1,3 +1,4 @@
+# Version 1.6.13: OFF通知文言改善・生産終了前のMFR測定記録必須化・Cost Saving週次グラフを複合表示へ改善
 # Version 1.6.12: Cost Saving実績管理を追加（生産/電源履歴・週次/日次効果・GitHub自動保存）
 # Version 1.6.11: ヘッダーへVer表示を追加・成型中/生産終了バッジを大型化・成型中アイコンを回転矢印へ変更
 # Version 1.6.10: 「次にやること」のMFR測定表示を「始／中／終 測定」に統一
@@ -33,6 +34,7 @@
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pandas as pd
 from datetime import datetime, timedelta, time as dt_time
 import pickle
@@ -537,7 +539,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.12"
+APP_VERSION = "1.6.13"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -584,6 +586,14 @@ def save_state():
         'acknowledged_alerts': st.session_state.acknowledged_alerts,
         # 実際に測定・点検が完了した10分後の電源OFF通知
         'pending_power_off_due': st.session_state.pending_power_off_due,
+        # OFF通知で「どの測定／点検が完了したか」を説明するための文脈。
+        'pending_power_off_context': st.session_state.get(
+            'pending_power_off_context'
+        ),
+        # 生産終了前に未記録MFR測定がある場合の確認待ち。
+        'pending_measurement_required_before_finish': st.session_state.get(
+            'pending_measurement_required_before_finish'
+        ),
         # 最終MFR測定後の「生産も終了ですか？」確認待ち。
         'pending_production_finish_confirmation': st.session_state.get(
             'pending_production_finish_confirmation'
@@ -1729,6 +1739,12 @@ if 'initialized' not in st.session_state:
         st.session_state.last_inspection_date = saved_state['last_inspection_date']
         st.session_state.acknowledged_alerts = saved_state.get('acknowledged_alerts', [])
         st.session_state.pending_power_off_due = saved_state.get('pending_power_off_due')
+        st.session_state.pending_power_off_context = saved_state.get(
+            'pending_power_off_context'
+        )
+        st.session_state.pending_measurement_required_before_finish = (
+            saved_state.get('pending_measurement_required_before_finish')
+        )
         st.session_state.pending_production_finish_confirmation = (
             saved_state.get('pending_production_finish_confirmation')
         )
@@ -1772,6 +1788,8 @@ if 'initialized' not in st.session_state:
         st.session_state.last_inspection_date = None
         st.session_state.acknowledged_alerts = []
         st.session_state.pending_power_off_due = None
+        st.session_state.pending_power_off_context = None
+        st.session_state.pending_measurement_required_before_finish = None
         st.session_state.pending_production_finish_confirmation = None
         st.session_state.pending_signboard_confirmation = None
         st.session_state.cost_saving_data = (
@@ -1847,6 +1865,10 @@ if 'acknowledged_alerts' not in st.session_state:
     st.session_state.acknowledged_alerts = []
 if 'pending_power_off_due' not in st.session_state:
     st.session_state.pending_power_off_due = None
+if 'pending_power_off_context' not in st.session_state:
+    st.session_state.pending_power_off_context = None
+if 'pending_measurement_required_before_finish' not in st.session_state:
+    st.session_state.pending_measurement_required_before_finish = None
 if 'mfr_power_is_on' not in st.session_state:
     st.session_state.mfr_power_is_on = False
 if 'mfr_power_on_confirmed_at' not in st.session_state:
@@ -1927,6 +1949,8 @@ with st.sidebar:
     if st.button("🔄 すべての成型機の状態をリセット"):
         st.session_state.jobs = {'100t': None, '450t': None, '550t': None}
         st.session_state.pending_power_off_due = None
+        st.session_state.pending_power_off_context = None
+        st.session_state.pending_measurement_required_before_finish = None
         st.session_state.mfr_power_is_on = False
         st.session_state.mfr_power_on_confirmed_at = None
         st.session_state.pending_production_start = None
@@ -2080,6 +2104,17 @@ def complete_mfr_measurement(machine, target_qty):
     st.session_state.pending_power_off_due = (
         now_jst + timedelta(minutes=10)
     )
+    measurement_label = get_measurement_text(
+        len(job.get('targets', [])),
+        target_qty,
+        job.get('targets', []),
+    )
+    st.session_state.pending_power_off_context = {
+        'type': 'measurement',
+        'machine': machine,
+        'label': measurement_label,
+        'completed_at': now_jst,
+    }
 
     all_measurements_completed = all(
         target in job['completed']
@@ -2146,6 +2181,7 @@ def undo_mfr_measurement(machine, target_qty):
     # 誤完了によって作られた10分後のOFF予約を解除する。
     # 未測定へ戻したポイントを含め、次回rerunで電源ON区間を再計算する。
     st.session_state.pending_power_off_due = None
+    st.session_state.pending_power_off_context = None
 
     pending_finish = st.session_state.get(
         'pending_production_finish_confirmation'
@@ -2381,18 +2417,55 @@ if pending_off_due is not None:
 
     if keep_power_on:
         st.session_state.pending_power_off_due = None
+        st.session_state.pending_power_off_context = None
         save_state()
     elif now >= pending_off_due:
         alert_id_off = f"OFF_ACTUAL_{pending_off_due.strftime('%Y%m%d_%H%M')}"
         if alert_id_off not in st.session_state.acknowledged_alerts:
+            off_context = st.session_state.get('pending_power_off_context') or {}
+            context_type = off_context.get('type')
+
+            if context_type == 'measurement':
+                source_text = (
+                    f"{off_context.get('machine', '対象')}の成型機の"
+                    f"「{off_context.get('label', 'MFR')}」の測定が完了しました。"
+                )
+            elif context_type == 'inspection':
+                source_text = "日常点検が完了しました。"
+            else:
+                source_text = "最後の測定・点検が完了しました。"
+
+            next_mfr_after_off = next(
+                (
+                    item for item in valid_upcoming
+                    if item['machine'] != '日常点検(A勤)'
+                    and item.get('est_time') is not None
+                    and item['est_time'] > now
+                ),
+                None,
+            )
+
+            if next_mfr_after_off is not None:
+                remaining_minutes = max(
+                    1,
+                    int(math.ceil(
+                        (next_mfr_after_off['est_time'] - now).total_seconds()
+                        / 60
+                    )),
+                )
+                next_measure_text = (
+                    f"次の測定まで{format_remaining_time(remaining_minutes)}あるため、"
+                )
+            else:
+                next_measure_text = "次のMFR測定予定がないため、"
+
             active_alerts.append({
                 "id": alert_id_off,
                 "due": pending_off_due,
                 "title": "💤 MFR電源OFFアラート",
                 "message": (
-                    f"最後の測定・点検完了から10分経過しました。"
-                    f"MFR測定器の電源をOFFにしてください。"
-                    f" 予定時刻：{pending_off_due.strftime('%m/%d %H:%M')}"
+                    f"{source_text} {next_measure_text}"
+                    "MFR測定器の電源をOFFにしてください。"
                 ),
                 "kind": "power_off",
             })
@@ -2510,6 +2583,7 @@ if active_alerts:
             st.session_state.mfr_power_is_on = False
             st.session_state.mfr_power_on_confirmed_at = None
             st.session_state.pending_power_off_due = None
+            st.session_state.pending_power_off_context = None
             cost_saving_changed = record_power_event(
                 "OFF",
                 power_off_confirmed_at,
@@ -2591,6 +2665,10 @@ with inspection_col:
             st.session_state.pending_power_off_due = (
                 now + timedelta(minutes=10)
             )
+            st.session_state.pending_power_off_context = {
+                'type': 'inspection',
+                'completed_at': now,
+            }
             save_state()
             st.rerun()
     else:
@@ -2897,8 +2975,19 @@ def finish_production(machine, job_id):
         return
 
     ended_at = datetime.utcnow() + timedelta(hours=9)
+    # 途中終了にも対応するため、予定生産数へ強制的に合わせない。
+    # 稼働中なら終了ボタンを押した時点までの推定生産数を確定する。
+    if job.get('status') == 'Running':
+        elapsed_sec = max(
+            0.0,
+            (ended_at - job['last_update']).total_seconds(),
+        )
+        job['current_qty'] = min(
+            int(job['current_qty'] + (elapsed_sec / job['cycle_time'])),
+            job['total_qty'],
+        )
+        job['last_update'] = ended_at
     job['status'] = 'Completed'
-    job['current_qty'] = job['total_qty']
     job['production_ended_at'] = ended_at
     archive_production_job(
         machine,
@@ -2911,6 +3000,65 @@ def finish_production(machine, job_id):
     sync_cost_saving_to_github()
     save_state()
     st.rerun()
+
+
+def get_missing_measurement_labels(job):
+    """生産終了前に未記録となっているMFR測定ラベルを返す。"""
+    targets = list(job.get('targets', [])) if job else []
+    completed = set(job.get('completed', [])) if job else set()
+    return [
+        get_measurement_text(len(targets), target, targets)
+        for target in targets
+        if target not in completed
+    ]
+
+
+def render_measurement_required_before_finish_dialog():
+    """未記録のMFR測定がある状態では生産終了させない。"""
+    pending = st.session_state.get(
+        'pending_measurement_required_before_finish'
+    )
+    if not pending:
+        return
+
+    machine = pending.get('machine')
+    job_id = pending.get('job_id')
+    job = st.session_state.jobs.get(machine)
+
+    if job is None or job.get('job_id') != job_id:
+        st.session_state.pending_measurement_required_before_finish = None
+        save_state()
+        return
+
+    missing_labels = get_missing_measurement_labels(job)
+    if not missing_labels:
+        st.session_state.pending_measurement_required_before_finish = None
+        save_state()
+        return
+
+    st.markdown("### MFR測定記録が未完了です")
+    st.caption(f"{machine} 成型機 ｜ {job.get('product_name', '')}")
+    st.warning(
+        "生産を終了する前に、必要なMFR測定をすべて実施し、"
+        "MFR測定の記録ボタンを押してください。"
+    )
+    st.markdown(
+        "**未記録：** " + "・".join(missing_labels) + " 測定"
+    )
+    st.info(
+        "予定数量の途中で生産を終了する場合でも、"
+        "製品マスターで設定された回数分のMFR測定記録が必要です。"
+    )
+
+    if st.button(
+        "↩️ 測定記録へ戻る",
+        type="primary",
+        use_container_width=True,
+        key=f"return_measurement_{machine}_{job_id}",
+    ):
+        st.session_state.pending_measurement_required_before_finish = None
+        save_state()
+        st.rerun()
 
 
 def render_production_finish_confirmation_dialog():
@@ -3057,6 +3205,22 @@ else:
     show_signboard_confirmation_dialog = render_signboard_confirmation_dialog
 
 
+# 生産終了ボタン押下時、MFR測定記録が不足している場合のダイアログ。
+if hasattr(st, "dialog"):
+    show_measurement_required_before_finish_dialog = st.dialog(
+        "📋 MFR測定記録の確認",
+        width="small",
+    )(render_measurement_required_before_finish_dialog)
+elif hasattr(st, "experimental_dialog"):
+    show_measurement_required_before_finish_dialog = st.experimental_dialog(
+        "📋 MFR測定記録の確認",
+    )(render_measurement_required_before_finish_dialog)
+else:
+    show_measurement_required_before_finish_dialog = (
+        render_measurement_required_before_finish_dialog
+    )
+
+
 # 最終測定後の生産終了確認ダイアログ。
 if hasattr(st, "dialog"):
     show_production_finish_confirmation_dialog = st.dialog(
@@ -3092,6 +3256,8 @@ else:
 
 if st.session_state.get('pending_signboard_confirmation'):
     show_signboard_confirmation_dialog()
+elif st.session_state.get('pending_measurement_required_before_finish'):
+    show_measurement_required_before_finish_dialog()
 elif st.session_state.get('pending_production_finish_confirmation'):
     show_production_finish_confirmation_dialog()
 elif st.session_state.get('pending_production_start'):
@@ -3217,6 +3383,17 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                             job['last_update'] = (datetime.utcnow() + timedelta(hours=9)); job['status'] = 'Running'; save_state(); st.rerun()
                 with col_ctrl2:
                     if st.button("⏹️ 生産終了", key=f"stop_main_{machine}"):
+                        missing_labels = get_missing_measurement_labels(job)
+                        if missing_labels:
+                            # 途中終了の場合も、製品マスターで設定された回数分の
+                            # MFR測定記録を完了するまで生産終了させない。
+                            st.session_state.pending_measurement_required_before_finish = {
+                                'machine': machine,
+                                'job_id': job.get('job_id'),
+                            }
+                            save_state()
+                            st.rerun()
+
                         ended_at = datetime.utcnow() + timedelta(hours=9)
                         job['current_qty'] = est_current
                         job['production_ended_at'] = ended_at
@@ -3231,6 +3408,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                         )
                         if pending_finish and pending_finish.get('machine') == machine:
                             st.session_state.pending_production_finish_confirmation = None
+                        st.session_state.pending_measurement_required_before_finish = None
                         st.session_state.jobs[machine] = None
                         save_state()
                         sync_cost_saving_to_github()
@@ -3715,22 +3893,98 @@ with cost_tab_week:
             hide_index=True,
         )
 
-        fig_cost = go.Figure()
-        fig_cost.add_trace(go.Bar(
-            x=weekly_df["週"],
-            y=weekly_df["週間効果(円)"],
-            name="週間効果",
-            marker_color="#2563eb",
-            text=weekly_df["週間効果(円)"].map(lambda value: f"¥{value:,.0f}"),
-            textposition="outside",
-        ))
+        # 上司への報告でも見栄えと内訳が分かるよう、
+        # 週次内訳＝積み上げ棒、累計効果＝折れ線の複合グラフにする。
+        fig_cost = make_subplots(specs=[[{"secondary_y": True}]])
+
+        component_specs = [
+            ("電気代削減(円)", "電気代削減", "#2563eb"),
+            ("労務費削減(円)", "労務費削減", "#f59e0b"),
+            ("設備消耗低減(円)", "設備消耗低減", "#7c3aed"),
+        ]
+        for column_name, trace_name, color in component_specs:
+            fig_cost.add_trace(
+                go.Bar(
+                    x=weekly_df["週"],
+                    y=weekly_df[column_name],
+                    name=trace_name,
+                    marker_color=color,
+                    hovertemplate=(
+                        "%{x}<br>" + trace_name + "：¥%{y:,.0f}<extra></extra>"
+                    ),
+                ),
+                secondary_y=False,
+            )
+
+        # 積み上げ棒の上に週間合計を表示。
+        fig_cost.add_trace(
+            go.Scatter(
+                x=weekly_df["週"],
+                y=weekly_df["週間効果(円)"],
+                mode="text",
+                text=weekly_df["週間効果(円)"].map(
+                    lambda value: f"¥{value:,.0f}"
+                ),
+                textposition="top center",
+                name="週間合計",
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            secondary_y=False,
+        )
+
+        fig_cost.add_trace(
+            go.Scatter(
+                x=weekly_df["週"],
+                y=weekly_df["累計効果(円)"],
+                name="累計効果",
+                mode="lines+markers",
+                line=dict(color="#0f172a", width=4),
+                marker=dict(size=9, color="#ffffff", line=dict(color="#0f172a", width=3)),
+                hovertemplate=(
+                    "%{x}<br>累計効果：¥%{y:,.0f}<extra></extra>"
+                ),
+            ),
+            secondary_y=True,
+        )
+
         fig_cost.update_layout(
-            title="週ごとのCost Saving効果",
-            xaxis_title="週",
-            yaxis_title="効果金額（円）",
-            height=420,
-            margin=dict(t=70, b=70, l=60, r=30),
-            showlegend=False,
+            title={
+                "text": "週ごとのCost Saving効果（内訳・累計）",
+                "x": 0.01,
+                "xanchor": "left",
+            },
+            barmode="stack",
+            hovermode="x unified",
+            height=500,
+            margin=dict(t=85, b=80, l=70, r=85),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0,
+            ),
+            plot_bgcolor="#ffffff",
+            paper_bgcolor="#ffffff",
+            font=dict(size=13, color="#1f2937"),
+        )
+        fig_cost.update_xaxes(
+            title_text="週",
+            showgrid=False,
+            tickangle=-20,
+        )
+        fig_cost.update_yaxes(
+            title_text="週間効果（円）",
+            secondary_y=False,
+            gridcolor="#e5e7eb",
+            rangemode="tozero",
+        )
+        fig_cost.update_yaxes(
+            title_text="累計効果（円）",
+            secondary_y=True,
+            showgrid=False,
+            rangemode="tozero",
         )
         st.plotly_chart(fig_cost, use_container_width=True)
 
