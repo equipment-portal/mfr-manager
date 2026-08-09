@@ -1,3 +1,4 @@
+# Version 1.6.20: Cost Saving週次グラフを6週固定枠表示・未実績の将来週も週枠と週ラベルを先行表示
 # Version 1.6.19: ダイアログ催促音を高音3連パルスへ強化・Cost Saving全削除後のUI状態を自動リセット
 # Version 1.6.18: 確認ダイアログ催促音を高音域へ変更（成形室の騒音下で気づきやすい音色）
 # Version 1.6.17: 確認ダイアログ専用の催促音を追加（応答まで繰返し・通常アラート音と分離）
@@ -782,7 +783,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.19"
+APP_VERSION = "1.6.20"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -4953,163 +4954,248 @@ with cost_tab_week:
             use_container_width=True,
             hide_index=True,
         )
-
-        # 上司への報告でも見栄えと週ごとの比較がしやすいよう、
-        # 週次内訳＝横並びのグループ棒、累計効果＝折れ線の複合グラフにする。
-        # 実績が少ない期間でも棒が横いっぱいに広がらないよう、
-        # 最低8週間分の横軸枠を確保する。
-        fig_cost = make_subplots(specs=[[{"secondary_y": True}]])
-
-        component_specs = [
-            ("電気代削減(円)", "電気代削減", "#2563eb", "#1e3a8a"),
-            ("労務費削減(円)", "労務費削減", "#f59e0b", "#92400e"),
-            ("設備消耗低減(円)", "設備消耗低減", "#7c3aed", "#4c1d95"),
-        ]
-        for column_name, trace_name, color, border_color in component_specs:
-            fig_cost.add_trace(
-                go.Bar(
-                    x=weekly_df["週"],
-                    y=weekly_df[column_name],
-                    name=trace_name,
-                    width=0.20,
-                    marker=dict(
-                        color=color,
-                        line=dict(color=border_color, width=1.2),
-                    ),
-                    hovertemplate=(
-                        "%{x}<br>" + trace_name + "：¥%{y:,.0f}<extra></extra>"
-                    ),
-                ),
-                secondary_y=False,
-            )
-
-        # 週ごとの棒グループ上部に、その週の合計金額を表示する。
-        component_columns = [item[0] for item in component_specs]
-        weekly_group_top = (
-            weekly_df[component_columns].max(axis=1).astype(float) * 1.10
+    else:
+        weekly_df = pd.DataFrame()
+        st.info(
+            "まだCost Saving実績はありません。"
+            "グラフには今週から6週間分の枠を表示しています。"
         )
-        weekly_group_top = weekly_group_top.where(
-            weekly_group_top > 0,
-            1.0,
-        )
-        fig_cost.add_trace(
-            go.Scatter(
-                x=weekly_df["週"],
-                y=weekly_group_top,
-                mode="text",
-                text=weekly_df["週間効果(円)"].map(
-                    lambda value: f"合計 ¥{value:,.0f}"
-                ),
-                textposition="top center",
-                textfont=dict(size=12, color="#334155"),
-                name="週間合計",
-                showlegend=False,
-                hoverinfo="skip",
-                cliponaxis=False,
+
+    # ------------------------------------------------------------------
+    # Cost Saving 週次グラフ
+    # ・常に6週間を1画面へ固定表示する。
+    # ・実績のない週も週枠と週ラベルを表示する。
+    # ・電気代／労務費／設備消耗低減は一定幅の3本を横並び表示。
+    # ・累計効果は実績が確定している現在週まで折れ線表示する。
+    # ------------------------------------------------------------------
+    actual_week_keys = sorted(
+        week_key
+        for week_key in weekly_effects.keys()
+        if week_key <= current_week_key
+    )
+
+    # 活動開始直後は最初の実績週を左端にし、将来週を多めに見せる。
+    # 3週以上経過後は「直近2週＋今週＋今後3週」の6週表示へ自動移行する。
+    first_actual_week = (
+        actual_week_keys[0]
+        if actual_week_keys
+        else current_week_key
+    )
+    chart_start_week = max(
+        first_actual_week,
+        current_week_key - timedelta(days=14),
+    )
+    chart_week_starts = [
+        chart_start_week + timedelta(days=7 * index)
+        for index in range(6)
+    ]
+
+    component_specs = [
+        ("electricity_yen", "電気代削減", "#2563eb", "#1e3a8a"),
+        ("labor_yen", "労務費削減", "#f59e0b", "#92400e"),
+        ("maintenance_yen", "設備消耗低減", "#7c3aed", "#4c1d95"),
+    ]
+
+    chart_rows = []
+    carry_before_chart = sum(
+        round(effect_total_yen(effect))
+        for week_key, effect in weekly_effects.items()
+        if week_key < chart_start_week
+    )
+    running_chart_total = float(carry_before_chart)
+
+    for index, week_start in enumerate(chart_week_starts):
+        week_end = week_start + timedelta(days=6)
+        effect = weekly_effects.get(week_start, {})
+        week_total = float(round(effect_total_yen(effect)))
+
+        # 未来週は予測値を描かず、累計線も現在週で止める。
+        if week_start <= current_week_key:
+            running_chart_total += week_total
+            cumulative_value = running_chart_total
+        else:
+            cumulative_value = None
+
+        chart_rows.append({
+            "x": index,
+            "week_start": week_start,
+            "week_end": week_end,
+            "tick": (
+                f"{week_start.strftime('%m/%d')}<br>"
+                f"～{week_end.strftime('%m/%d')}"
             ),
-            secondary_y=False,
-        )
+            "hover_week": (
+                f"{week_start.strftime('%Y/%m/%d')}～"
+                f"{week_end.strftime('%m/%d')}"
+            ),
+            "electricity_yen": float(
+                effect.get("electricity_yen", 0) or 0
+            ),
+            "labor_yen": float(effect.get("labor_yen", 0) or 0),
+            "maintenance_yen": float(
+                effect.get("maintenance_yen", 0) or 0
+            ),
+            "week_total": week_total,
+            "cumulative": cumulative_value,
+        })
 
-        # 累計効果の折れ線はこれまでどおり第2軸で表示する。
+    chart_df = pd.DataFrame(chart_rows)
+    fig_cost = make_subplots(specs=[[{"secondary_y": True}]])
+
+    for value_key, trace_name, color, border_color in component_specs:
         fig_cost.add_trace(
-            go.Scatter(
-                x=weekly_df["週"],
-                y=weekly_df["累計効果(円)"],
-                name="累計効果",
-                mode="lines+markers",
-                line=dict(color="#0f172a", width=4),
+            go.Bar(
+                x=chart_df["x"],
+                y=chart_df[value_key],
+                name=trace_name,
+                width=0.18,
                 marker=dict(
-                    size=9,
-                    color="#ffffff",
-                    line=dict(color="#0f172a", width=3),
+                    color=color,
+                    line=dict(color=border_color, width=1.2),
                 ),
+                customdata=chart_df["hover_week"],
                 hovertemplate=(
-                    "%{x}<br>累計効果：¥%{y:,.0f}<extra></extra>"
+                    "%{customdata}<br>"
+                    + trace_name
+                    + "：¥%{y:,.0f}<extra></extra>"
                 ),
             ),
-            secondary_y=True,
-        )
-
-        # 実績が1～7週しかなくても、直近8週間分の枠を表示する。
-        # 将来週は表示せず、現在週を右端にして週次推移が自然に見えるようにする。
-        visible_week_count = max(8, min(52, len(weekly_df)))
-        chart_week_starts = [
-            current_week_key - timedelta(days=7 * offset)
-            for offset in range(visible_week_count - 1, -1, -1)
-        ]
-        chart_week_labels = []
-        chart_week_ticktexts = []
-        for week_start in chart_week_starts:
-            week_end = week_start + timedelta(days=6)
-            chart_week_labels.append(
-                f"{week_start.strftime('%Y/%m/%d')}～{week_end.strftime('%m/%d')}"
-            )
-            chart_week_ticktexts.append(
-                f"{week_start.strftime('%m/%d')}<br>～{week_end.strftime('%m/%d')}"
-            )
-
-        # 8週以上の実績がある場合は、weekly_dfに含まれる全週（最大52週）を表示する。
-        if len(weekly_df) >= 8:
-            chart_week_labels = weekly_df["週"].tolist()
-            chart_week_ticktexts = []
-            for week_label in chart_week_labels:
-                try:
-                    start_text, end_text = week_label.split("～", 1)
-                    start_dt = datetime.strptime(start_text, "%Y/%m/%d")
-                    chart_week_ticktexts.append(
-                        f"{start_dt.strftime('%m/%d')}<br>～{end_text}"
-                    )
-                except Exception:
-                    chart_week_ticktexts.append(week_label)
-
-        fig_cost.update_layout(
-            title={
-                "text": "週ごとのCost Saving効果（週別内訳・累計）",
-                "x": 0.01,
-                "xanchor": "left",
-            },
-            barmode="group",
-            bargap=0.38,
-            bargroupgap=0.10,
-            hovermode="x unified",
-            height=520,
-            margin=dict(t=90, b=85, l=70, r=85),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="left",
-                x=0,
-            ),
-            plot_bgcolor="#ffffff",
-            paper_bgcolor="#ffffff",
-            font=dict(size=13, color="#1f2937"),
-        )
-        fig_cost.update_xaxes(
-            title_text="週",
-            type="category",
-            categoryorder="array",
-            categoryarray=chart_week_labels,
-            tickmode="array",
-            tickvals=chart_week_labels,
-            ticktext=chart_week_ticktexts,
-            showgrid=False,
-            tickangle=0,
-        )
-        fig_cost.update_yaxes(
-            title_text="週間効果（円）",
             secondary_y=False,
-            gridcolor="#e5e7eb",
-            rangemode="tozero",
         )
-        fig_cost.update_yaxes(
-            title_text="累計効果（円）",
-            secondary_y=True,
-            showgrid=False,
-            rangemode="tozero",
-        )
-        st.plotly_chart(fig_cost, use_container_width=True)
 
+    # 実績のある週だけ、その週の合計金額を3本の棒の上へ表示する。
+    component_value_keys = [item[0] for item in component_specs]
+    group_tops = chart_df[component_value_keys].max(axis=1).astype(float)
+    group_text_y = group_tops.where(group_tops > 0, 0) * 1.12
+    group_text = [
+        f"合計 ¥{value:,.0f}" if value > 0 else ""
+        for value in chart_df["week_total"]
+    ]
+    fig_cost.add_trace(
+        go.Scatter(
+            x=chart_df["x"],
+            y=group_text_y,
+            mode="text",
+            text=group_text,
+            textposition="top center",
+            textfont=dict(size=12, color="#334155"),
+            name="週間合計",
+            showlegend=False,
+            hoverinfo="skip",
+            cliponaxis=False,
+        ),
+        secondary_y=False,
+    )
+
+    # 累計効果は将来週へ予測延長せず、現在週までの実績だけを結ぶ。
+    fig_cost.add_trace(
+        go.Scatter(
+            x=chart_df["x"],
+            y=chart_df["cumulative"],
+            name="累計効果",
+            mode="lines+markers",
+            connectgaps=False,
+            line=dict(color="#0f172a", width=4),
+            marker=dict(
+                size=9,
+                color="#ffffff",
+                line=dict(color="#0f172a", width=3),
+            ),
+            customdata=chart_df["hover_week"],
+            hovertemplate=(
+                "%{customdata}<br>累計効果：¥%{y:,.0f}<extra></extra>"
+            ),
+        ),
+        secondary_y=True,
+    )
+
+    # 6週間それぞれに固定枠を描画する。
+    # 実績ゼロの週でも枠が残るため、週の区切りが一目で分かる。
+    for index in range(6):
+        fig_cost.add_shape(
+            type="rect",
+            xref="x",
+            yref="paper",
+            x0=index - 0.46,
+            x1=index + 0.46,
+            y0=0,
+            y1=1,
+            line=dict(color="#cbd5e1", width=1.1),
+            fillcolor=(
+                "rgba(248,250,252,0.60)"
+                if index % 2 == 0
+                else "rgba(255,255,255,0.30)"
+            ),
+            layer="below",
+        )
+
+    left_axis_max = max(
+        1.0,
+        float(chart_df[component_value_keys].max(axis=1).max() or 0) * 1.35,
+    )
+    cumulative_values = [
+        float(value)
+        for value in chart_df["cumulative"].tolist()
+        if value is not None and not pd.isna(value)
+    ]
+    right_axis_max = max(
+        1.0,
+        (max(cumulative_values) if cumulative_values else 0.0) * 1.20,
+    )
+
+    fig_cost.update_layout(
+        title={
+            "text": "週ごとのCost Saving効果（週別内訳・累計）",
+            "x": 0.01,
+            "xanchor": "left",
+        },
+        barmode="group",
+        bargap=0.34,
+        bargroupgap=0.08,
+        hovermode="x unified",
+        height=520,
+        margin=dict(t=90, b=90, l=70, r=85),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+        ),
+        plot_bgcolor="#ffffff",
+        paper_bgcolor="#ffffff",
+        font=dict(size=13, color="#1f2937"),
+    )
+    fig_cost.update_xaxes(
+        title_text="週",
+        type="linear",
+        range=[-0.55, 5.55],
+        tickmode="array",
+        tickvals=list(range(6)),
+        ticktext=chart_df["tick"].tolist(),
+        showgrid=False,
+        zeroline=False,
+        tickangle=0,
+        fixedrange=False,
+    )
+    fig_cost.update_yaxes(
+        title_text="週間効果（円）",
+        secondary_y=False,
+        gridcolor="#e5e7eb",
+        range=[0, left_axis_max],
+        zeroline=True,
+        zerolinecolor="#94a3b8",
+    )
+    fig_cost.update_yaxes(
+        title_text="累計効果（円）",
+        secondary_y=True,
+        showgrid=False,
+        range=[0, right_axis_max],
+        zeroline=False,
+    )
+    st.plotly_chart(fig_cost, use_container_width=True)
+
+    if not weekly_df.empty:
         weekly_csv = weekly_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
             "⬇️ 週次実績CSVをダウンロード",
@@ -5117,8 +5203,6 @@ with cost_tab_week:
             file_name="MFR_Cost_Saving_週次実績.csv",
             mime="text/csv",
         )
-    else:
-        st.info("まだCost Saving実績はありません。")
 
 with cost_tab_day:
     day_rows = []
