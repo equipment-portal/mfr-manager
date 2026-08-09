@@ -1,3 +1,4 @@
+# Version 1.6.18: 確認ダイアログ催促音を高音域へ変更（成形室の騒音下で気づきやすい音色）
 # Version 1.6.17: 確認ダイアログ専用の催促音を追加（応答まで繰返し・通常アラート音と分離）
 # Version 1.6.16: Cost Saving履歴の個別削除・週単位削除・全削除と削除後自動再集計を追加
 # Version 1.6.15: EcoNaviとCost Savingの表示順を入れ替え（EcoNaviを上、Cost Savingを下）
@@ -872,7 +873,7 @@ ALERT_SOUND_FILE = os.path.join(
     "alert_crystal_rise.wav",
 )
 ALERT_SOUND_NAME = "クリスタルライズ"
-ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_6_17"
+ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_6_18"
 
 # 未確認中のWindows通知を再表示する間隔。
 # Excelを前面で使用していても気づきやすいよう、30秒ごとに再通知します。
@@ -1123,17 +1124,18 @@ def render_monitor_activation():
     compressor.connect(audioContext.destination);
 
     const master = audioContext.createGain();
-    master.gain.setValueAtTime(0.72, now);
+    master.gain.setValueAtTime(0.82, now);
     master.connect(compressor);
 
     // ダイアログ専用「確認催促音」。
-    // 短い高低のダブルパルスを2セット鳴らし、
+    // 成形室の騒音下でも気づきやすいよう、2kHz～3kHz帯の
+    // 高いダブルパルスを2セット鳴らす。
     // 通常のクリスタルライズとは明確に区別する。
     const events = [
-      {start: 0.00, frequency: 880.00, duration: 0.13, level: 0.62},
-      {start: 0.17, frequency: 1174.66, duration: 0.15, level: 0.72},
-      {start: 0.52, frequency: 880.00, duration: 0.13, level: 0.62},
-      {start: 0.69, frequency: 1174.66, duration: 0.18, level: 0.76}
+      {start: 0.00, frequency: 2100.00, duration: 0.11, level: 0.72},
+      {start: 0.15, frequency: 3100.00, duration: 0.13, level: 0.84},
+      {start: 0.48, frequency: 2100.00, duration: 0.11, level: 0.72},
+      {start: 0.63, frequency: 3100.00, duration: 0.15, level: 0.88}
     ];
 
     for (const event of events) {
