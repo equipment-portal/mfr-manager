@@ -1,3 +1,4 @@
+# Version 1.6.15: EcoNaviとCost Savingの表示順を入れ替え（EcoNaviを上、Cost Savingを下）
 # Version 1.6.14: Cost Saving週次グラフを週別グループ棒＋累計折れ線へ変更・少数週でも横幅を固定
 # Version 1.6.13: OFF通知文言改善・生産終了前のMFR測定記録必須化・Cost Saving週次グラフを複合表示へ改善
 # Version 1.6.12: Cost Saving実績管理を追加（生産/電源履歴・週次/日次効果・GitHub自動保存）
@@ -3740,6 +3741,518 @@ else:
     st.info("📊 グラフを表示するための稼働中のジョブはありません。")
 
 
+# --- UI：🌱EcoNavi ---
+st.markdown("---")
+st.header("🌱 EcoNavi")
+st.write(
+    "日々のこまめな電源OFF運用によって節約できる「電気代」、"
+    "「ヒーター等の設備寿命延長に伴う修繕費の削減額」、"
+    "および「電源管理に必要な管理工数（労務費）」を自動計算する"
+    "シミュレーターです。"
+)
+
+with st.expander(
+    "📊 現在のスケジュールにおける削減効果金額を計算",
+    expanded=True,
+):
+    # 1段目：電力・設備関係の条件
+    col_k, col_e, col_h, col_l = st.columns(4)
+
+    with col_k:
+        power_kw = st.number_input(
+            "MFR消費電力 (kW)",
+            min_value=0.0,
+            value=0.80,
+            step=0.10,
+            format="%.2f",
+            help="最大値 0.80 kW",
+        )
+
+    with col_e:
+        elec_price = st.number_input(
+            "電気代単価 (円/kWh)",
+            min_value=0.0,
+            value=25.00,
+            step=1.00,
+            format="%.2f",
+            help="暫定単価25円/kWh",
+        )
+
+    with col_h:
+        heater_cost = st.number_input(
+            "修繕・メンテナンス費用 (円)",
+            min_value=0,
+            value=0,
+            step=10000,
+            help="初期値は0円です。設備費を計算する場合のみ入力してください。",
+        )
+
+    with col_l:
+        heater_life_hours = st.number_input(
+            "メンテナンス周期 (時間)",
+            min_value=0,
+            value=0,
+            step=1000,
+            help="初期値は0時間です。設備費を計算する場合のみ入力してください。",
+        )
+
+    # 2段目：管理工数・労務費の条件
+    st.markdown("##### 👷 管理工数・労務費の条件")
+    col_wage, col_manual_time, col_system_time = st.columns(3)
+
+    with col_wage:
+        labor_hourly_rate = st.number_input(
+            "1時間当たりの労務費 (円/h)",
+            min_value=0,
+            value=4600,
+            step=100,
+            help=(
+                "デフォルトは4,600円/hです。"
+                "0円にすると、管理工数・労務費を計算から除外します。"
+            ),
+        )
+
+    with col_manual_time:
+        manual_minutes_per_job = st.number_input(
+            "システムなしの管理時間 (分/Lot)",
+            min_value=0.0,
+            value=5.0,
+            step=0.5,
+            format="%.1f",
+            help=(
+                "測定時刻、電源ON/OFF時刻、3台の予定重複、"
+                "申し送りを手作業で確認する時間です。"
+            ),
+        )
+
+    with col_system_time:
+        st.metric(
+            "システム使用時の管理時間",
+            "0.0 分/Lot",
+            "時刻を自動算出",
+            help=(
+                "システムが測定時刻と電源ON/OFF時刻を自動算出するため、"
+                "管理計算工数は0分として計算します。"
+            ),
+        )
+
+    # 設備費または周期のどちらかが0なら、修繕費計算を完全に除外する。
+    maintenance_enabled = heater_cost > 0 and heater_life_hours > 0
+
+    # 労務費または管理時間が0なら、管理工数・労務費計算を完全に除外する。
+    labor_enabled = labor_hourly_rate > 0 and manual_minutes_per_job > 0
+
+    excluded_messages = []
+    if not maintenance_enabled:
+        excluded_messages.append(
+            "修繕・メンテナンス費用または周期が0のため、"
+            "設備寿命・修繕費"
+        )
+    if not labor_enabled:
+        excluded_messages.append(
+            "労務費または管理時間が0のため、管理工数・労務費"
+        )
+
+    if excluded_messages:
+        st.info(
+            "ℹ️ "
+            + "、".join(excluded_messages)
+            + "は計算対象外です。0円の項目は合計金額とグラフに含めません。"
+        )
+
+    if timeline_data and on_blocks:
+        schedule_start = min(d["Start"] for d in timeline_data)
+        schedule_end = max(d["End"] for d in timeline_data)
+
+        total_hours = max(
+            0.0,
+            (schedule_end - schedule_start).total_seconds() / 3600,
+        )
+        new_on_hours = max(
+            0.0,
+            sum(
+                (b_end - b_start).total_seconds()
+                for b_start, b_end in on_blocks
+            )
+            / 3600,
+        )
+        saved_hours = max(0.0, total_hours - new_on_hours)
+
+        # 現在登録されているLot数を管理工数の対象とする。
+        managed_job_count = sum(
+            1
+            for job in st.session_state.jobs.values()
+            if job is not None
+        )
+
+        if labor_enabled:
+            manual_labor_hours = (
+                managed_job_count * manual_minutes_per_job / 60
+            )
+            system_labor_hours = 0.0
+            old_labor = manual_labor_hours * labor_hourly_rate
+            new_labor = system_labor_hours * labor_hourly_rate
+            saved_labor_cost = max(0.0, old_labor - new_labor)
+        else:
+            manual_labor_hours = 0.0
+            system_labor_hours = 0.0
+            old_labor = 0.0
+            new_labor = 0.0
+            saved_labor_cost = 0.0
+
+        # 電力削減時間が0でも、管理工数削減がある場合は結果を表示する。
+        if saved_hours > 0 or saved_labor_cost > 0:
+            saved_cost = saved_hours * power_kw * elec_price
+
+            if maintenance_enabled:
+                maintenance_cost_per_hour = (
+                    heater_cost / heater_life_hours
+                )
+                saved_heater_value = (
+                    saved_hours * maintenance_cost_per_hour
+                )
+                old_maint = total_hours * maintenance_cost_per_hour
+                new_maint = new_on_hours * maintenance_cost_per_hour
+            else:
+                maintenance_cost_per_hour = 0.0
+                saved_heater_value = 0.0
+                old_maint = 0.0
+                new_maint = 0.0
+
+            st.info(
+                f"✨ **現在のスケジュール期間中"
+                f"（約 {total_hours:.1f} 時間・"
+                f"{managed_job_count} Lot）の改善効果**"
+            )
+
+            res_col1, res_col2, res_col3, res_col4 = st.columns(4)
+
+            help_time = (
+                "【計算式】\n"
+                "従来OFFにしていなかった全期間の時間"
+                " － 今回のスケジュールでONになっている時間"
+            )
+            help_elec = (
+                "【計算式】\n"
+                "削減できた待機時間 × MFR消費電力(kW)"
+                " × 電気代単価"
+            )
+            help_maint = (
+                "【計算式】\n"
+                "削減できた待機時間 × "
+                "(修繕・メンテナンス費用 ÷ メンテナンス周期)\n\n"
+                "※費用または周期を0にすると、この計算を除外します。"
+            )
+            help_labor = (
+                "【システムなし】\n"
+                "現在のLot数 × 手作業の管理時間(分/Lot)"
+                " ÷ 60 × 労務費(円/h)\n\n"
+                "【システム使用】\n"
+                "測定時刻・電源ON/OFF時刻を自動算出するため0円\n\n"
+                "※労務費または管理時間を0にすると、"
+                "この計算を除外します。"
+            )
+
+            res_col1.metric(
+                "無駄な待機時間の削減",
+                f"{saved_hours:.1f} 時間",
+                (
+                    f"従来: {total_hours:.1f}h"
+                    f" → 今回: {new_on_hours:.1f}h"
+                ),
+                delta_color="inverse",
+                help=help_time,
+            )
+
+            res_col2.metric(
+                "電気代の削減",
+                f"{int(saved_cost):,} 円",
+                f"▲ {int(saved_cost):,}円",
+                delta_color="inverse",
+                help=help_elec,
+            )
+
+            if maintenance_enabled:
+                res_col3.metric(
+                    "設備寿命(修繕費)の節約換算",
+                    f"{int(saved_heater_value):,} 円",
+                    "部品の長寿命化による効果",
+                    help=help_maint,
+                )
+            else:
+                res_col3.metric(
+                    "設備寿命(修繕費)",
+                    "計算対象外",
+                    "0設定のため除外",
+                    help=help_maint,
+                )
+
+            if labor_enabled:
+                res_col4.metric(
+                    "管理工数(労務費)の削減",
+                    f"{int(saved_labor_cost):,} 円",
+                    (
+                        f"手動: {manual_labor_hours:.2f}h"
+                        f" → システム: {system_labor_hours:.2f}h"
+                    ),
+                    delta_color="inverse",
+                    help=help_labor,
+                )
+            else:
+                res_col4.metric(
+                    "管理工数(労務費)",
+                    "計算対象外",
+                    "0設定のため除外",
+                    help=help_labor,
+                )
+
+            included_items = ["電気代"]
+            if maintenance_enabled:
+                included_items.append("設備寿命（修繕費）")
+            if labor_enabled:
+                included_items.append("管理工数（労務費）")
+
+            st.caption(
+                "※"
+                + "・".join(included_items)
+                + "の概算を、現在のスケジュールを基に計算しています。"
+            )
+
+            if labor_enabled:
+                st.caption(
+                    "※管理工数は、システムを使用せず必要時のみ電源管理を"
+                    "行う場合に発生する、測定時刻・電源ON/OFF時刻・"
+                    "3台の予定重複・申し送りの確認工数を、"
+                    f"1Lot当たり {manual_minutes_per_job:.1f} 分として"
+                    "換算した回避効果です。"
+                )
+
+            # --- 可視化グラフ ---
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            old_elec = total_hours * power_kw * elec_price
+            new_elec = new_on_hours * power_kw * elec_price
+
+            total_old = old_elec + old_maint + old_labor
+            total_new = new_elec + new_maint + new_labor
+            saved_total = max(0.0, total_old - total_new)
+
+            old_label = "❌ 改善前相当<br>(連続ON＋手動管理)"
+            new_label = "✨ システム運用<br>(必要時のみON)"
+
+            eco_rows = [
+                {
+                    "運用方法": old_label,
+                    "コスト内訳": "電気代",
+                    "金額": old_elec,
+                },
+                {
+                    "運用方法": new_label,
+                    "コスト内訳": "電気代",
+                    "金額": new_elec,
+                },
+            ]
+
+            if maintenance_enabled:
+                eco_rows.extend(
+                    [
+                        {
+                            "運用方法": old_label,
+                            "コスト内訳": "修繕費 (寿命換算)",
+                            "金額": old_maint,
+                        },
+                        {
+                            "運用方法": new_label,
+                            "コスト内訳": "修繕費 (寿命換算)",
+                            "金額": new_maint,
+                        },
+                    ]
+                )
+
+            # 労務費が0の場合は、行自体を追加せずグラフから完全に除外する。
+            if labor_enabled:
+                eco_rows.extend(
+                    [
+                        {
+                            "運用方法": old_label,
+                            "コスト内訳": "管理工数 (労務費)",
+                            "金額": old_labor,
+                        },
+                        {
+                            "運用方法": new_label,
+                            "コスト内訳": "管理工数 (労務費)",
+                            "金額": new_labor,
+                        },
+                    ]
+                )
+
+            df_eco = pd.DataFrame(eco_rows)
+
+            chart_title = (
+                "<b>📊 システム運用による総合コスト削減効果</b>"
+                if maintenance_enabled or labor_enabled
+                else "<b>📊 システム運用による電気代削減効果</b>"
+            )
+
+            fig_eco = px.bar(
+                df_eco,
+                x="運用方法",
+                y="金額",
+                color="コスト内訳",
+                text="金額",
+                color_discrete_map={
+                    "電気代": "#f4a261",
+                    "修繕費 (寿命換算)": "#e76f51",
+                    "管理工数 (労務費)": "#457b9d",
+                },
+            )
+
+            # 金額が小さい区分でも文字を縮小せず、常に同じ大きさで表示する。
+            # 棒の中に収まらない場合は自動的に外側へ移動する。
+            fig_eco.update_traces(
+                texttemplate="<b>%{text:,.0f} 円</b>",
+                textposition="auto",
+                textangle=0,
+                insidetextfont=dict(size=18, color="white"),
+                outsidetextfont=dict(size=18, color="#111111"),
+                constraintext="none",
+                cliponaxis=False,
+            )
+
+            # 全費用が0でもPlotlyで0除算しないよう、最低1円幅を確保する。
+            y_axis_max = max(max(total_old, total_new) * 1.5, 1.0)
+
+            fig_eco.update_layout(
+                barmode="stack",
+                # Plotlyの自動縮小を無効化し、すべての金額ラベルを18pxで統一する。
+                uniformtext=dict(minsize=18, mode="show"),
+                height=590,
+                title=dict(text=chart_title, font=dict(size=22)),
+                xaxis_title="",
+                yaxis_title="発生コスト（円）",
+                yaxis=dict(
+                    range=[0, y_axis_max],
+                    tickfont=dict(size=14, weight="bold"),
+                ),
+                xaxis=dict(tickfont=dict(size=17, weight="bold")),
+                legend=dict(
+                    title="<b>コスト内訳</b>",
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1,
+                    font=dict(size=14, weight="bold"),
+                ),
+                margin=dict(t=90, b=70, l=50, r=50),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(250, 250, 250, 1)",
+                yaxis_showgrid=True,
+                yaxis_gridcolor="rgba(200,200,200,0.5)",
+            )
+
+            fig_eco.add_annotation(
+                x=old_label,
+                y=total_old,
+                yshift=15,
+                yanchor="bottom",
+                text=f"<b>計 {int(total_old):,} 円</b>",
+                showarrow=False,
+                font=dict(size=22),
+            )
+
+            fig_eco.add_annotation(
+                x=new_label,
+                y=total_new,
+                yshift=15,
+                yanchor="bottom",
+                text=f"<b>計 {int(total_new):,} 円</b>",
+                showarrow=False,
+                font=dict(size=22, color="#1d4ed8"),
+            )
+
+            approx_dx_px = 500
+            approx_dy_px = (
+                ((total_old - total_new) / y_axis_max) * 400
+            )
+            angle_deg = int(
+                math.degrees(
+                    math.atan2(approx_dy_px, approx_dx_px)
+                )
+            )
+
+            fig_eco.add_annotation(
+                x=0.5,
+                y=(total_old + total_new) / 2,
+                xref="paper",
+                yref="y",
+                text=(
+                    "<span style='font-size:80px;color:#e63946;"
+                    "text-shadow:2px 2px 3px rgba(0,0,0,0.2);'>"
+                    "➡</span>"
+                ),
+                showarrow=False,
+                textangle=angle_deg,
+            )
+
+            fig_eco.add_annotation(
+                x=0.5,
+                y=max(
+                    max(total_old, total_new) * 1.15,
+                    y_axis_max * 0.75,
+                ),
+                xref="paper",
+                yref="y",
+                yanchor="bottom",
+                text=(
+                    "<b>✨ 削減効果</b><br><br>"
+                    "<b><span style='font-size:42px;color:#d00000;'>"
+                    f"▲ {int(saved_total):,} 円"
+                    "</span></b>"
+                ),
+                showarrow=False,
+                font=dict(size=22, color="#111"),
+                bgcolor="#fffdeb",
+                bordercolor="#e63946",
+                borderwidth=3,
+                borderpad=15,
+            )
+
+            st.plotly_chart(fig_eco, use_container_width=True)
+
+            # 計算内訳を画面上でも確認できるように表示する。
+            with st.expander("🧮 管理工数・労務費の計算内訳", expanded=False):
+                if labor_enabled:
+                    st.code(
+                        f"対象Lot数：{managed_job_count} Lot\n"
+                        f"システムなし："
+                        f"{managed_job_count} Lot × "
+                        f"{manual_minutes_per_job:.1f}分 ÷ 60分 × "
+                        f"{labor_hourly_rate:,}円/h"
+                        f" ＝ {int(old_labor):,}円\n"
+                        f"システム使用：自動算出のため "
+                        f"{int(new_labor):,}円\n"
+                        f"管理工数削減："
+                        f"{int(old_labor):,}円 － {int(new_labor):,}円"
+                        f" ＝ {int(saved_labor_cost):,}円"
+                    )
+                else:
+                    st.write(
+                        "労務費または管理時間が0のため、"
+                        "管理工数・労務費は計算対象外です。"
+                    )
+
+        else:
+            st.info(
+                "現在のスケジュールでは、電源OFFによる削減時間と"
+                "管理工数の削減効果がありません。"
+            )
+    else:
+        st.write(
+            "稼働中のジョブを登録すると、ここに削減効果金額が表示されます。"
+        )
+
+
 # --- UI：Cost Saving 実績 ---
 st.markdown("---")
 st.header("💰 Cost Saving")
@@ -4269,515 +4782,4 @@ with cost_tab_settings:
     else:
         st.caption(
             "GitHubトークンが設定されていないため、現在はローカル保存です。"
-        )
-
-# --- UI：🌱EcoNavi ---
-st.markdown("---")
-st.header("🌱 EcoNavi")
-st.write(
-    "日々のこまめな電源OFF運用によって節約できる「電気代」、"
-    "「ヒーター等の設備寿命延長に伴う修繕費の削減額」、"
-    "および「電源管理に必要な管理工数（労務費）」を自動計算する"
-    "シミュレーターです。"
-)
-
-with st.expander(
-    "📊 現在のスケジュールにおける削減効果金額を計算",
-    expanded=True,
-):
-    # 1段目：電力・設備関係の条件
-    col_k, col_e, col_h, col_l = st.columns(4)
-
-    with col_k:
-        power_kw = st.number_input(
-            "MFR消費電力 (kW)",
-            min_value=0.0,
-            value=0.80,
-            step=0.10,
-            format="%.2f",
-            help="最大値 0.80 kW",
-        )
-
-    with col_e:
-        elec_price = st.number_input(
-            "電気代単価 (円/kWh)",
-            min_value=0.0,
-            value=25.00,
-            step=1.00,
-            format="%.2f",
-            help="暫定単価25円/kWh",
-        )
-
-    with col_h:
-        heater_cost = st.number_input(
-            "修繕・メンテナンス費用 (円)",
-            min_value=0,
-            value=0,
-            step=10000,
-            help="初期値は0円です。設備費を計算する場合のみ入力してください。",
-        )
-
-    with col_l:
-        heater_life_hours = st.number_input(
-            "メンテナンス周期 (時間)",
-            min_value=0,
-            value=0,
-            step=1000,
-            help="初期値は0時間です。設備費を計算する場合のみ入力してください。",
-        )
-
-    # 2段目：管理工数・労務費の条件
-    st.markdown("##### 👷 管理工数・労務費の条件")
-    col_wage, col_manual_time, col_system_time = st.columns(3)
-
-    with col_wage:
-        labor_hourly_rate = st.number_input(
-            "1時間当たりの労務費 (円/h)",
-            min_value=0,
-            value=4600,
-            step=100,
-            help=(
-                "デフォルトは4,600円/hです。"
-                "0円にすると、管理工数・労務費を計算から除外します。"
-            ),
-        )
-
-    with col_manual_time:
-        manual_minutes_per_job = st.number_input(
-            "システムなしの管理時間 (分/Lot)",
-            min_value=0.0,
-            value=5.0,
-            step=0.5,
-            format="%.1f",
-            help=(
-                "測定時刻、電源ON/OFF時刻、3台の予定重複、"
-                "申し送りを手作業で確認する時間です。"
-            ),
-        )
-
-    with col_system_time:
-        st.metric(
-            "システム使用時の管理時間",
-            "0.0 分/Lot",
-            "時刻を自動算出",
-            help=(
-                "システムが測定時刻と電源ON/OFF時刻を自動算出するため、"
-                "管理計算工数は0分として計算します。"
-            ),
-        )
-
-    # 設備費または周期のどちらかが0なら、修繕費計算を完全に除外する。
-    maintenance_enabled = heater_cost > 0 and heater_life_hours > 0
-
-    # 労務費または管理時間が0なら、管理工数・労務費計算を完全に除外する。
-    labor_enabled = labor_hourly_rate > 0 and manual_minutes_per_job > 0
-
-    excluded_messages = []
-    if not maintenance_enabled:
-        excluded_messages.append(
-            "修繕・メンテナンス費用または周期が0のため、"
-            "設備寿命・修繕費"
-        )
-    if not labor_enabled:
-        excluded_messages.append(
-            "労務費または管理時間が0のため、管理工数・労務費"
-        )
-
-    if excluded_messages:
-        st.info(
-            "ℹ️ "
-            + "、".join(excluded_messages)
-            + "は計算対象外です。0円の項目は合計金額とグラフに含めません。"
-        )
-
-    if timeline_data and on_blocks:
-        schedule_start = min(d["Start"] for d in timeline_data)
-        schedule_end = max(d["End"] for d in timeline_data)
-
-        total_hours = max(
-            0.0,
-            (schedule_end - schedule_start).total_seconds() / 3600,
-        )
-        new_on_hours = max(
-            0.0,
-            sum(
-                (b_end - b_start).total_seconds()
-                for b_start, b_end in on_blocks
-            )
-            / 3600,
-        )
-        saved_hours = max(0.0, total_hours - new_on_hours)
-
-        # 現在登録されているLot数を管理工数の対象とする。
-        managed_job_count = sum(
-            1
-            for job in st.session_state.jobs.values()
-            if job is not None
-        )
-
-        if labor_enabled:
-            manual_labor_hours = (
-                managed_job_count * manual_minutes_per_job / 60
-            )
-            system_labor_hours = 0.0
-            old_labor = manual_labor_hours * labor_hourly_rate
-            new_labor = system_labor_hours * labor_hourly_rate
-            saved_labor_cost = max(0.0, old_labor - new_labor)
-        else:
-            manual_labor_hours = 0.0
-            system_labor_hours = 0.0
-            old_labor = 0.0
-            new_labor = 0.0
-            saved_labor_cost = 0.0
-
-        # 電力削減時間が0でも、管理工数削減がある場合は結果を表示する。
-        if saved_hours > 0 or saved_labor_cost > 0:
-            saved_cost = saved_hours * power_kw * elec_price
-
-            if maintenance_enabled:
-                maintenance_cost_per_hour = (
-                    heater_cost / heater_life_hours
-                )
-                saved_heater_value = (
-                    saved_hours * maintenance_cost_per_hour
-                )
-                old_maint = total_hours * maintenance_cost_per_hour
-                new_maint = new_on_hours * maintenance_cost_per_hour
-            else:
-                maintenance_cost_per_hour = 0.0
-                saved_heater_value = 0.0
-                old_maint = 0.0
-                new_maint = 0.0
-
-            st.info(
-                f"✨ **現在のスケジュール期間中"
-                f"（約 {total_hours:.1f} 時間・"
-                f"{managed_job_count} Lot）の改善効果**"
-            )
-
-            res_col1, res_col2, res_col3, res_col4 = st.columns(4)
-
-            help_time = (
-                "【計算式】\n"
-                "従来OFFにしていなかった全期間の時間"
-                " － 今回のスケジュールでONになっている時間"
-            )
-            help_elec = (
-                "【計算式】\n"
-                "削減できた待機時間 × MFR消費電力(kW)"
-                " × 電気代単価"
-            )
-            help_maint = (
-                "【計算式】\n"
-                "削減できた待機時間 × "
-                "(修繕・メンテナンス費用 ÷ メンテナンス周期)\n\n"
-                "※費用または周期を0にすると、この計算を除外します。"
-            )
-            help_labor = (
-                "【システムなし】\n"
-                "現在のLot数 × 手作業の管理時間(分/Lot)"
-                " ÷ 60 × 労務費(円/h)\n\n"
-                "【システム使用】\n"
-                "測定時刻・電源ON/OFF時刻を自動算出するため0円\n\n"
-                "※労務費または管理時間を0にすると、"
-                "この計算を除外します。"
-            )
-
-            res_col1.metric(
-                "無駄な待機時間の削減",
-                f"{saved_hours:.1f} 時間",
-                (
-                    f"従来: {total_hours:.1f}h"
-                    f" → 今回: {new_on_hours:.1f}h"
-                ),
-                delta_color="inverse",
-                help=help_time,
-            )
-
-            res_col2.metric(
-                "電気代の削減",
-                f"{int(saved_cost):,} 円",
-                f"▲ {int(saved_cost):,}円",
-                delta_color="inverse",
-                help=help_elec,
-            )
-
-            if maintenance_enabled:
-                res_col3.metric(
-                    "設備寿命(修繕費)の節約換算",
-                    f"{int(saved_heater_value):,} 円",
-                    "部品の長寿命化による効果",
-                    help=help_maint,
-                )
-            else:
-                res_col3.metric(
-                    "設備寿命(修繕費)",
-                    "計算対象外",
-                    "0設定のため除外",
-                    help=help_maint,
-                )
-
-            if labor_enabled:
-                res_col4.metric(
-                    "管理工数(労務費)の削減",
-                    f"{int(saved_labor_cost):,} 円",
-                    (
-                        f"手動: {manual_labor_hours:.2f}h"
-                        f" → システム: {system_labor_hours:.2f}h"
-                    ),
-                    delta_color="inverse",
-                    help=help_labor,
-                )
-            else:
-                res_col4.metric(
-                    "管理工数(労務費)",
-                    "計算対象外",
-                    "0設定のため除外",
-                    help=help_labor,
-                )
-
-            included_items = ["電気代"]
-            if maintenance_enabled:
-                included_items.append("設備寿命（修繕費）")
-            if labor_enabled:
-                included_items.append("管理工数（労務費）")
-
-            st.caption(
-                "※"
-                + "・".join(included_items)
-                + "の概算を、現在のスケジュールを基に計算しています。"
-            )
-
-            if labor_enabled:
-                st.caption(
-                    "※管理工数は、システムを使用せず必要時のみ電源管理を"
-                    "行う場合に発生する、測定時刻・電源ON/OFF時刻・"
-                    "3台の予定重複・申し送りの確認工数を、"
-                    f"1Lot当たり {manual_minutes_per_job:.1f} 分として"
-                    "換算した回避効果です。"
-                )
-
-            # --- 可視化グラフ ---
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            old_elec = total_hours * power_kw * elec_price
-            new_elec = new_on_hours * power_kw * elec_price
-
-            total_old = old_elec + old_maint + old_labor
-            total_new = new_elec + new_maint + new_labor
-            saved_total = max(0.0, total_old - total_new)
-
-            old_label = "❌ 改善前相当<br>(連続ON＋手動管理)"
-            new_label = "✨ システム運用<br>(必要時のみON)"
-
-            eco_rows = [
-                {
-                    "運用方法": old_label,
-                    "コスト内訳": "電気代",
-                    "金額": old_elec,
-                },
-                {
-                    "運用方法": new_label,
-                    "コスト内訳": "電気代",
-                    "金額": new_elec,
-                },
-            ]
-
-            if maintenance_enabled:
-                eco_rows.extend(
-                    [
-                        {
-                            "運用方法": old_label,
-                            "コスト内訳": "修繕費 (寿命換算)",
-                            "金額": old_maint,
-                        },
-                        {
-                            "運用方法": new_label,
-                            "コスト内訳": "修繕費 (寿命換算)",
-                            "金額": new_maint,
-                        },
-                    ]
-                )
-
-            # 労務費が0の場合は、行自体を追加せずグラフから完全に除外する。
-            if labor_enabled:
-                eco_rows.extend(
-                    [
-                        {
-                            "運用方法": old_label,
-                            "コスト内訳": "管理工数 (労務費)",
-                            "金額": old_labor,
-                        },
-                        {
-                            "運用方法": new_label,
-                            "コスト内訳": "管理工数 (労務費)",
-                            "金額": new_labor,
-                        },
-                    ]
-                )
-
-            df_eco = pd.DataFrame(eco_rows)
-
-            chart_title = (
-                "<b>📊 システム運用による総合コスト削減効果</b>"
-                if maintenance_enabled or labor_enabled
-                else "<b>📊 システム運用による電気代削減効果</b>"
-            )
-
-            fig_eco = px.bar(
-                df_eco,
-                x="運用方法",
-                y="金額",
-                color="コスト内訳",
-                text="金額",
-                color_discrete_map={
-                    "電気代": "#f4a261",
-                    "修繕費 (寿命換算)": "#e76f51",
-                    "管理工数 (労務費)": "#457b9d",
-                },
-            )
-
-            # 金額が小さい区分でも文字を縮小せず、常に同じ大きさで表示する。
-            # 棒の中に収まらない場合は自動的に外側へ移動する。
-            fig_eco.update_traces(
-                texttemplate="<b>%{text:,.0f} 円</b>",
-                textposition="auto",
-                textangle=0,
-                insidetextfont=dict(size=18, color="white"),
-                outsidetextfont=dict(size=18, color="#111111"),
-                constraintext="none",
-                cliponaxis=False,
-            )
-
-            # 全費用が0でもPlotlyで0除算しないよう、最低1円幅を確保する。
-            y_axis_max = max(max(total_old, total_new) * 1.5, 1.0)
-
-            fig_eco.update_layout(
-                barmode="stack",
-                # Plotlyの自動縮小を無効化し、すべての金額ラベルを18pxで統一する。
-                uniformtext=dict(minsize=18, mode="show"),
-                height=590,
-                title=dict(text=chart_title, font=dict(size=22)),
-                xaxis_title="",
-                yaxis_title="発生コスト（円）",
-                yaxis=dict(
-                    range=[0, y_axis_max],
-                    tickfont=dict(size=14, weight="bold"),
-                ),
-                xaxis=dict(tickfont=dict(size=17, weight="bold")),
-                legend=dict(
-                    title="<b>コスト内訳</b>",
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1,
-                    font=dict(size=14, weight="bold"),
-                ),
-                margin=dict(t=90, b=70, l=50, r=50),
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(250, 250, 250, 1)",
-                yaxis_showgrid=True,
-                yaxis_gridcolor="rgba(200,200,200,0.5)",
-            )
-
-            fig_eco.add_annotation(
-                x=old_label,
-                y=total_old,
-                yshift=15,
-                yanchor="bottom",
-                text=f"<b>計 {int(total_old):,} 円</b>",
-                showarrow=False,
-                font=dict(size=22),
-            )
-
-            fig_eco.add_annotation(
-                x=new_label,
-                y=total_new,
-                yshift=15,
-                yanchor="bottom",
-                text=f"<b>計 {int(total_new):,} 円</b>",
-                showarrow=False,
-                font=dict(size=22, color="#1d4ed8"),
-            )
-
-            approx_dx_px = 500
-            approx_dy_px = (
-                ((total_old - total_new) / y_axis_max) * 400
-            )
-            angle_deg = int(
-                math.degrees(
-                    math.atan2(approx_dy_px, approx_dx_px)
-                )
-            )
-
-            fig_eco.add_annotation(
-                x=0.5,
-                y=(total_old + total_new) / 2,
-                xref="paper",
-                yref="y",
-                text=(
-                    "<span style='font-size:80px;color:#e63946;"
-                    "text-shadow:2px 2px 3px rgba(0,0,0,0.2);'>"
-                    "➡</span>"
-                ),
-                showarrow=False,
-                textangle=angle_deg,
-            )
-
-            fig_eco.add_annotation(
-                x=0.5,
-                y=max(
-                    max(total_old, total_new) * 1.15,
-                    y_axis_max * 0.75,
-                ),
-                xref="paper",
-                yref="y",
-                yanchor="bottom",
-                text=(
-                    "<b>✨ 削減効果</b><br><br>"
-                    "<b><span style='font-size:42px;color:#d00000;'>"
-                    f"▲ {int(saved_total):,} 円"
-                    "</span></b>"
-                ),
-                showarrow=False,
-                font=dict(size=22, color="#111"),
-                bgcolor="#fffdeb",
-                bordercolor="#e63946",
-                borderwidth=3,
-                borderpad=15,
-            )
-
-            st.plotly_chart(fig_eco, use_container_width=True)
-
-            # 計算内訳を画面上でも確認できるように表示する。
-            with st.expander("🧮 管理工数・労務費の計算内訳", expanded=False):
-                if labor_enabled:
-                    st.code(
-                        f"対象Lot数：{managed_job_count} Lot\n"
-                        f"システムなし："
-                        f"{managed_job_count} Lot × "
-                        f"{manual_minutes_per_job:.1f}分 ÷ 60分 × "
-                        f"{labor_hourly_rate:,}円/h"
-                        f" ＝ {int(old_labor):,}円\n"
-                        f"システム使用：自動算出のため "
-                        f"{int(new_labor):,}円\n"
-                        f"管理工数削減："
-                        f"{int(old_labor):,}円 － {int(new_labor):,}円"
-                        f" ＝ {int(saved_labor_cost):,}円"
-                    )
-                else:
-                    st.write(
-                        "労務費または管理時間が0のため、"
-                        "管理工数・労務費は計算対象外です。"
-                    )
-
-        else:
-            st.info(
-                "現在のスケジュールでは、電源OFFによる削減時間と"
-                "管理工数の削減効果がありません。"
-            )
-    else:
-        st.write(
-            "稼働中のジョブを登録すると、ここに削減効果金額が表示されます。"
         )
