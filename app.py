@@ -1,3 +1,4 @@
+# Version 1.6.21: 新規アラート発生時に通知欄へ自動スクロール・生産終了後は自動で停止中へ戻す
 # Version 1.6.20: Cost Saving週次グラフを6週固定枠表示・未実績の将来週も週枠と週ラベルを先行表示
 # Version 1.6.19: ダイアログ催促音を高音3連パルスへ強化・Cost Saving全削除後のUI状態を自動リセット
 # Version 1.6.18: 確認ダイアログ催促音を高音域へ変更（成形室の騒音下で気づきやすい音色）
@@ -783,7 +784,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.20"
+APP_VERSION = "1.6.21"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -1937,6 +1938,71 @@ def stop_dialog_reminder():
     )
 
 
+
+def scroll_to_active_alert(alert_id):
+    """
+    新しいアラートが発生した瞬間だけ、親Edge画面の通知欄へ自動スクロールする。
+
+    10秒ごとの自動更新で同じアラートへ何度も引き戻さないよう、
+    最後に自動スクロールしたアラートIDをlocalStorageへ保存する。
+    """
+    alert_id_json = json.dumps(str(alert_id), ensure_ascii=False)
+    scroll_code = f"""
+(() => {{
+  const alertId = {alert_id_json};
+  const storageKey = "mfr_last_auto_scrolled_alert_id";
+
+  if (localStorage.getItem(storageKey) === alertId) {{
+    return;
+  }}
+
+  let attempts = 0;
+  const scrollWhenReady = () => {{
+    attempts += 1;
+    const target = document.getElementById("mfr-active-alert-anchor");
+
+    if (target) {{
+      try {{
+        target.scrollIntoView({{
+          behavior: "smooth",
+          block: "start",
+          inline: "nearest"
+        }});
+        localStorage.setItem(storageKey, alertId);
+      }} catch (error) {{
+        window.scrollTo({{top: 0, behavior: "smooth"}});
+        localStorage.setItem(storageKey, alertId);
+      }}
+      return;
+    }}
+
+    if (attempts < 40) {{
+      window.setTimeout(scrollWhenReady, 100);
+    }}
+  }};
+
+  scrollWhenReady();
+}})();
+"""
+    scroll_code_js = json.dumps(scroll_code)
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const parentWindow = window.parent;
+          const scrollCode = {scroll_code_js};
+          const script = parentWindow.document.createElement("script");
+          script.textContent = scrollCode;
+          parentWindow.document.head.appendChild(script);
+          script.remove();
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def get_measurement_text(num_targets, current_target_qty, targets):
     if num_targets == 2:
         if current_target_qty == targets[0]: return '始'
@@ -3037,6 +3103,7 @@ if active_alerts:
     overdue_time_text = format_remaining_time(overdue_minutes)
     st.markdown(
         f"""
+        <div id="mfr-active-alert-anchor" style="scroll-margin-top:12px;"></div>
         <div class="mfr-active-alert">
             <div style="font-size:1.7rem;font-weight:800;">{primary_alert["title"]}</div>
             <div style="font-size:1.25rem;margin-top:8px;">{primary_alert["message"]}</div>
@@ -3045,6 +3112,7 @@ if active_alerts:
         """,
         unsafe_allow_html=True,
     )
+    scroll_to_active_alert(primary_alert["id"])
 
     if primary_alert["kind"] == "measurement":
         ack_button_text = "✅ 測定済みとして記録（通知音を停止）"
@@ -3512,6 +3580,8 @@ def finish_production(machine, job_id):
             job['total_qty'],
         )
         job['last_update'] = ended_at
+    # 履歴保存用に生産終了状態を確定するが、画面上には終了状態を残さない。
+    # Cost Savingへ履歴を保存した直後に、その成型機を停止中（job=None）へ戻す。
     job['status'] = 'Completed'
     job['production_ended_at'] = ended_at
     archive_production_job(
@@ -3521,6 +3591,7 @@ def finish_production(machine, job_id):
         'final_measurement_confirmed',
     )
     st.session_state.pending_production_finish_confirmation = None
+    st.session_state.jobs[machine] = None
     save_state()
     sync_cost_saving_to_github()
     save_state()
@@ -3814,6 +3885,29 @@ else:
     stop_dialog_reminder()
 
 
+# V1.6.21以前の保存データで「Completed」が残っている場合も、
+# 成型機画面は自動的に停止中へ戻す。
+legacy_completed_cleared = False
+for machine_name, saved_job in list(st.session_state.jobs.items()):
+    if saved_job is not None and saved_job.get('status') == 'Completed':
+        ended_at = saved_job.get('production_ended_at')
+        if not isinstance(ended_at, datetime):
+            ended_at = datetime.utcnow() + timedelta(hours=9)
+        archive_production_job(
+            machine_name,
+            saved_job,
+            ended_at,
+            'legacy_completed_auto_clear',
+        )
+        st.session_state.jobs[machine_name] = None
+        legacy_completed_cleared = True
+
+if legacy_completed_cleared:
+    save_state()
+    sync_cost_saving_to_github()
+    save_state()
+    st.rerun()
+
 # --- UI：成型機コントロールパネル ---
 st.markdown('<div class="top-section-title">🏭 成型機</div>', unsafe_allow_html=True)
 cols_top = st.columns(3)
@@ -3964,17 +4058,6 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                         sync_cost_saving_to_github()
                         save_state()
                         st.rerun()
-
-            if job['status'] == 'Completed':
-                if st.button("🔄 次の製品の生産をセット", key=f"next_ok_{machine}"):
-                    pending_finish = st.session_state.get(
-                        'pending_production_finish_confirmation'
-                    )
-                    if pending_finish and pending_finish.get('machine') == machine:
-                        st.session_state.pending_production_finish_confirmation = None
-                    st.session_state.jobs[machine] = None
-                    save_state()
-                    st.rerun()
 
             st.divider()
             st.markdown('<div class="mfr-status-header">📋 MFR測定</div>', unsafe_allow_html=True)
