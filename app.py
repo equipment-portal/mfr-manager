@@ -1,3 +1,4 @@
+# Version 1.6.22: 実機MFRが測定可能済みなら新規Lotの「始」を即時測定にする判定を追加
 # Version 1.6.21: 新規アラート発生時に通知欄へ自動スクロール・生産終了後は自動で停止中へ戻す
 # Version 1.6.20: Cost Saving週次グラフを6週固定枠表示・未実績の将来週も週枠と週ラベルを先行表示
 # Version 1.6.19: ダイアログ催促音を高音3連パルスへ強化・Cost Saving全削除後のUI状態を自動リセット
@@ -784,7 +785,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.21"
+APP_VERSION = "1.6.22"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -3425,6 +3426,45 @@ st.caption(
 st.markdown("---")
 
 
+def has_mfr_measurement_since(power_on_at, reference_time=None):
+    """
+    現在のMFR電源ON期間中に、すでに実測定が完了しているかを判定する。
+
+    1回でも実測定が完了していれば、その時点でMFRは測定可能温度に
+    到達していたことが確認できるため、新規Lotの「始」測定を
+    追加の60分待ちにしない。
+    """
+    if not isinstance(power_on_at, datetime):
+        return False
+
+    if reference_time is None:
+        reference_time = datetime.utcnow() + timedelta(hours=9)
+
+    for active_job in st.session_state.jobs.values():
+        if active_job is None:
+            continue
+
+        for record in active_job.get('measurement_records', []):
+            if not isinstance(record, dict):
+                continue
+
+            measured_at = record.get('measured_at')
+            if isinstance(measured_at, datetime):
+                measured_dt = measured_at
+            elif isinstance(measured_at, str):
+                try:
+                    measured_dt = datetime.fromisoformat(measured_at)
+                except ValueError:
+                    continue
+            else:
+                continue
+
+            if power_on_at <= measured_dt <= reference_time:
+                return True
+
+    return False
+
+
 def finalize_production_start_with_actual_power(power_is_on):
     """
     生産開始時に作業者が目視確認した実機MFR電源状態を正として、
@@ -3453,6 +3493,7 @@ def finalize_production_start_with_actual_power(power_is_on):
     if power_is_on:
         # 実機ONを最優先する。
         st.session_state.mfr_power_is_on = True
+        mfr_ready_now = False
 
         if (
             previous_power_is_on
@@ -3465,6 +3506,20 @@ def finalize_production_start_with_actual_power(power_is_on):
                 power_on_at
                 + timedelta(minutes=MFR_WARMUP_MINUTES)
             )
+
+            # 60分未満でも、このON期間中に他LotのMFR測定が
+            # すでに完了していれば、実機は測定可能状態と判断する。
+            # 例：100tの「始」測定済み後に450tを開始した場合。
+            mfr_ready_now = (
+                heat_ready_at <= now_jst
+                or has_mfr_measurement_since(
+                    power_on_at,
+                    now_jst,
+                )
+            )
+
+            if mfr_ready_now:
+                heat_ready_at = now_jst
         else:
             # PC記録と不一致で「実機はON」と回答された場合は、
             # 作業者の実機確認を優先し、すでに測定可能なON状態として扱う。
@@ -3474,6 +3529,7 @@ def finalize_production_start_with_actual_power(power_is_on):
                 - timedelta(minutes=MFR_WARMUP_MINUTES)
             )
             heat_ready_at = now_jst
+            mfr_ready_now = True
 
             # 他の稼働中Lotも、実機が加熱済みであるという
             # 作業者確認に同期する。
@@ -3488,9 +3544,9 @@ def finalize_production_start_with_actual_power(power_is_on):
 
         st.session_state.mfr_power_on_confirmed_at = power_on_at
 
-        # 既存ON時刻から60分未満なら、残り加熱時間を引き継ぐ。
-        # 60分以上加熱済み＋ゼロ開始なら、「始」は即時測定。
-        if heat_ready_at <= now_jst:
+        # MFRがすでに測定可能で、ゼロから開始するLotなら、
+        # 「始」測定を生産開始直後の予定にする。
+        if mfr_ready_now:
             heat_ready_at = now_jst
             if (
                 current_qty == 0
