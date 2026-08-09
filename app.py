@@ -1,3 +1,5 @@
+# Version 1.6.17: 確認ダイアログ専用の催促音を追加（応答まで繰返し・通常アラート音と分離）
+# Version 1.6.16: Cost Saving履歴の個別削除・週単位削除・全削除と削除後自動再集計を追加
 # Version 1.6.15: EcoNaviとCost Savingの表示順を入れ替え（EcoNaviを上、Cost Savingを下）
 # Version 1.6.14: Cost Saving週次グラフを週別グループ棒＋累計折れ線へ変更・少数週でも横幅を固定
 # Version 1.6.13: OFF通知文言改善・生産終了前のMFR測定記録必須化・Cost Saving週次グラフを複合表示へ改善
@@ -112,10 +114,15 @@ DEFAULT_COST_SAVING_SETTINGS = {
 
 def get_default_cost_saving_data():
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "settings": dict(DEFAULT_COST_SAVING_SETTINGS),
         "production_history": [],
         "power_events": [],
+        # 削除済みIDはクラウド側の古い履歴が再同期で復活しないための墓標。
+        "deleted_production_ids": [],
+        "deleted_power_event_ids": [],
+        # 週単位削除では電源ON/OFFの連続性を壊さず、その週だけ集計対象外にする。
+        "excluded_weeks": [],
     }
 
 
@@ -137,11 +144,49 @@ def normalize_cost_saving_data(data):
     if not isinstance(power_events, list):
         power_events = []
 
+    deleted_production_ids = data.get("deleted_production_ids", [])
+    if not isinstance(deleted_production_ids, list):
+        deleted_production_ids = []
+    deleted_production_ids = list(dict.fromkeys(
+        str(value) for value in deleted_production_ids if value
+    ))
+
+    deleted_power_event_ids = data.get("deleted_power_event_ids", [])
+    if not isinstance(deleted_power_event_ids, list):
+        deleted_power_event_ids = []
+    deleted_power_event_ids = list(dict.fromkeys(
+        str(value) for value in deleted_power_event_ids if value
+    ))
+
+    excluded_weeks = data.get("excluded_weeks", [])
+    if not isinstance(excluded_weeks, list):
+        excluded_weeks = []
+    excluded_weeks = list(dict.fromkeys(
+        str(value) for value in excluded_weeks if value
+    ))
+
+    deleted_production_set = set(deleted_production_ids)
+    production_history = [
+        item for item in production_history
+        if not isinstance(item, dict)
+        or str(item.get("job_id", "")) not in deleted_production_set
+    ]
+
+    deleted_power_set = set(deleted_power_event_ids)
+    power_events = [
+        item for item in power_events
+        if not isinstance(item, dict)
+        or str(item.get("event_id", "")) not in deleted_power_set
+    ]
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "settings": settings,
         "production_history": production_history,
         "power_events": power_events,
+        "deleted_production_ids": deleted_production_ids,
+        "deleted_power_event_ids": deleted_power_event_ids,
+        "excluded_weeks": excluded_weeks,
     }
 
 
@@ -185,19 +230,47 @@ def merge_cost_saving_data(remote_data, local_data, prefer_local_settings=True):
         settings = dict(local["settings"])
         settings.update(remote["settings"])
 
+    deleted_production_ids = list(dict.fromkeys(
+        remote.get("deleted_production_ids", [])
+        + local.get("deleted_production_ids", [])
+    ))
+    deleted_power_event_ids = list(dict.fromkeys(
+        remote.get("deleted_power_event_ids", [])
+        + local.get("deleted_power_event_ids", [])
+    ))
+    excluded_weeks = list(dict.fromkeys(
+        remote.get("excluded_weeks", [])
+        + local.get("excluded_weeks", [])
+    ))
+
+    production_history = _merge_history_by_key(
+        remote["production_history"],
+        local["production_history"],
+        "job_id",
+    )
+    production_history = [
+        item for item in production_history
+        if str(item.get("job_id", "")) not in set(deleted_production_ids)
+    ]
+
+    power_events = _merge_history_by_key(
+        remote["power_events"],
+        local["power_events"],
+        "event_id",
+    )
+    power_events = [
+        item for item in power_events
+        if str(item.get("event_id", "")) not in set(deleted_power_event_ids)
+    ]
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "settings": settings,
-        "production_history": _merge_history_by_key(
-            remote["production_history"],
-            local["production_history"],
-            "job_id",
-        ),
-        "power_events": _merge_history_by_key(
-            remote["power_events"],
-            local["power_events"],
-            "event_id",
-        ),
+        "production_history": production_history,
+        "power_events": power_events,
+        "deleted_production_ids": deleted_production_ids,
+        "deleted_power_event_ids": deleted_power_event_ids,
+        "excluded_weeks": excluded_weeks,
     }
 
 
@@ -296,6 +369,9 @@ def record_power_event(action, actual_time, alert_id, scheduled_time=None):
         st.session_state.get("cost_saving_data")
     )
     event_id = str(alert_id)
+    if event_id in set(data.get("deleted_power_event_ids", [])):
+        st.session_state.cost_saving_data = data
+        return False
     if any(
         str(event.get("event_id")) == event_id
         for event in data["power_events"]
@@ -328,6 +404,9 @@ def archive_production_job(machine, job, ended_at, completion_type):
         st.session_state.get("cost_saving_data")
     )
     job_id = str(job["job_id"])
+    if job_id in set(data.get("deleted_production_ids", [])):
+        st.session_state.cost_saving_data = data
+        return False
     if any(
         str(record.get("job_id")) == job_id
         for record in data["production_history"]
@@ -502,6 +581,7 @@ def build_cost_saving_summary(cost_data, now_jst):
     data = normalize_cost_saving_data(cost_data)
     daily = {}
     weekly = {}
+    excluded_week_keys = set(data.get("excluded_weeks", []))
 
     intervals = build_power_off_intervals(
         data["power_events"],
@@ -523,8 +603,22 @@ def build_cost_saving_summary(cost_data, now_jst):
         )
         day_key = ended_at.replace(hour=0, minute=0, second=0, microsecond=0)
         week_key = _week_start(ended_at)
+        week_key_text = week_key.strftime("%Y-%m-%d")
+        if week_key_text in excluded_week_keys:
+            continue
         _add_effect(daily, day_key, labor_yen=labor_yen, lots=1)
         _add_effect(weekly, week_key, labor_yen=labor_yen, lots=1)
+
+    # 週単位削除済みの週は、電源OFF区間由来の効果も含めて集計から除外する。
+    if excluded_week_keys:
+        weekly = {
+            key: value for key, value in weekly.items()
+            if key.strftime("%Y-%m-%d") not in excluded_week_keys
+        }
+        daily = {
+            key: value for key, value in daily.items()
+            if _week_start(key).strftime("%Y-%m-%d") not in excluded_week_keys
+        }
 
     return daily, weekly, intervals
 
@@ -536,12 +630,157 @@ def effect_total_yen(row):
         + float(row.get("maintenance_yen", 0) or 0)
     )
 
+
+def format_cost_saving_week_label(week_start):
+    week_end = week_start + timedelta(days=6)
+    return (
+        f"{week_start.strftime('%Y/%m/%d')}～"
+        f"{week_end.strftime('%m/%d')}"
+    )
+
+
+def get_cost_saving_history_weeks(cost_data):
+    """生産履歴または電源履歴が存在する週を月曜始まりで返す。"""
+    data = normalize_cost_saving_data(cost_data)
+    weeks = set()
+    excluded = set(data.get("excluded_weeks", []))
+
+    for record in data.get("production_history", []):
+        if not isinstance(record, dict):
+            continue
+        ended_at = parse_history_datetime(record.get("ended_at"))
+        if ended_at is not None:
+            weeks.add(_week_start(ended_at))
+
+    for event in data.get("power_events", []):
+        if not isinstance(event, dict):
+            continue
+        actual_at = parse_history_datetime(event.get("actual_at"))
+        if actual_at is not None:
+            weeks.add(_week_start(actual_at))
+
+    # すでに週削除済みの週は再削除候補に出さない。
+    return sorted(
+        [week for week in weeks if week.strftime("%Y-%m-%d") not in excluded],
+        reverse=True,
+    )
+
+
+def delete_cost_saving_production_record(job_id):
+    """生産履歴1件を削除し、クラウド再同期でも復活しないよう墓標を残す。"""
+    data = normalize_cost_saving_data(
+        st.session_state.get("cost_saving_data")
+    )
+    job_id = str(job_id or "")
+    if not job_id:
+        return False
+
+    before_count = len(data["production_history"])
+    data["production_history"] = [
+        record for record in data["production_history"]
+        if str(record.get("job_id", "")) != job_id
+    ]
+    if len(data["production_history"]) == before_count:
+        return False
+
+    deleted_ids = list(data.get("deleted_production_ids", []))
+    if job_id not in deleted_ids:
+        deleted_ids.append(job_id)
+    data["deleted_production_ids"] = deleted_ids
+    st.session_state.cost_saving_data = normalize_cost_saving_data(data)
+    return True
+
+
+def delete_cost_saving_week(week_start):
+    """
+    指定週のCost Saving実績を削除する。
+
+    生産履歴は実データから削除する。電源ON/OFF履歴は隣接週とのOFF→ON連続性を
+    壊さないため内部時系列を保持しつつ、その週の表示・集計から除外する。
+    """
+    if not isinstance(week_start, datetime):
+        return False
+
+    data = normalize_cost_saving_data(
+        st.session_state.get("cost_saving_data")
+    )
+    target_key = _week_start(week_start).strftime("%Y-%m-%d")
+
+    deleted_ids = list(data.get("deleted_production_ids", []))
+    kept_records = []
+    removed_any = False
+    for record in data["production_history"]:
+        ended_at = parse_history_datetime(record.get("ended_at"))
+        if (
+            ended_at is not None
+            and _week_start(ended_at).strftime("%Y-%m-%d") == target_key
+        ):
+            job_id = str(record.get("job_id", ""))
+            if job_id and job_id not in deleted_ids:
+                deleted_ids.append(job_id)
+            removed_any = True
+            continue
+        kept_records.append(record)
+
+    data["production_history"] = kept_records
+    data["deleted_production_ids"] = deleted_ids
+
+    excluded_weeks = list(data.get("excluded_weeks", []))
+    if target_key not in excluded_weeks:
+        excluded_weeks.append(target_key)
+        removed_any = True
+    data["excluded_weeks"] = excluded_weeks
+
+    st.session_state.cost_saving_data = normalize_cost_saving_data(data)
+    return removed_any
+
+
+def delete_all_cost_saving_history():
+    """計算条件を残し、生産履歴・電源実績をすべて削除する。"""
+    data = normalize_cost_saving_data(
+        st.session_state.get("cost_saving_data")
+    )
+
+    deleted_production_ids = list(data.get("deleted_production_ids", []))
+    for record in data["production_history"]:
+        job_id = str(record.get("job_id", ""))
+        if job_id and job_id not in deleted_production_ids:
+            deleted_production_ids.append(job_id)
+
+    deleted_power_event_ids = list(data.get("deleted_power_event_ids", []))
+    for event in data["power_events"]:
+        event_id = str(event.get("event_id", ""))
+        if event_id and event_id not in deleted_power_event_ids:
+            deleted_power_event_ids.append(event_id)
+
+    had_history = bool(
+        data["production_history"]
+        or data["power_events"]
+        or data.get("excluded_weeks")
+    )
+
+    data["production_history"] = []
+    data["power_events"] = []
+    data["deleted_production_ids"] = deleted_production_ids
+    data["deleted_power_event_ids"] = deleted_power_event_ids
+    data["excluded_weeks"] = []
+    st.session_state.cost_saving_data = normalize_cost_saving_data(data)
+    return had_history
+
+
+def save_cost_saving_history_change():
+    """削除などの履歴変更をローカル保存し、墓標込みでGitHubへ同期する。"""
+    save_state()
+    cloud_saved = sync_cost_saving_to_github()
+    save_state()
+    return cloud_saved
+
 # ページ設定
 logo_path = "logo.png" 
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.14"
+APP_VERSION = "1.6.17"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -633,7 +872,7 @@ ALERT_SOUND_FILE = os.path.join(
     "alert_crystal_rise.wav",
 )
 ALERT_SOUND_NAME = "クリスタルライズ"
-ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_5_0"
+ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_6_17"
 
 # 未確認中のWindows通知を再表示する間隔。
 # Excelを前面で使用していても気づきやすいよう、30秒ごとに再通知します。
@@ -820,7 +1059,12 @@ def render_monitor_activation():
     watchdog: null,
     alertId: null,
     sources: [],
-    lastPlayAt: 0
+    lastPlayAt: 0,
+    urgentTimer: null,
+    urgentWatchdog: null,
+    urgentDialogId: null,
+    urgentSources: [],
+    urgentLastPlayAt: 0
   };
 
   function getAudioContext() {
@@ -850,6 +1094,166 @@ def render_monitor_activation():
       } catch (error) {}
     }
     state.sources = [];
+  }
+
+  function stopUrgentSources() {
+    for (const oscillator of state.urgentSources) {
+      try {
+        oscillator.stop();
+      } catch (error) {}
+    }
+    state.urgentSources = [];
+  }
+
+  async function playUrgentOnce() {
+    const audioContext = getAudioContext();
+
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    const now = audioContext.currentTime + 0.02;
+
+    const compressor = audioContext.createDynamicsCompressor();
+    compressor.threshold.setValueAtTime(-16, now);
+    compressor.knee.setValueAtTime(10, now);
+    compressor.ratio.setValueAtTime(5, now);
+    compressor.attack.setValueAtTime(0.002, now);
+    compressor.release.setValueAtTime(0.18, now);
+    compressor.connect(audioContext.destination);
+
+    const master = audioContext.createGain();
+    master.gain.setValueAtTime(0.72, now);
+    master.connect(compressor);
+
+    // ダイアログ専用「確認催促音」。
+    // 短い高低のダブルパルスを2セット鳴らし、
+    // 通常のクリスタルライズとは明確に区別する。
+    const events = [
+      {start: 0.00, frequency: 880.00, duration: 0.13, level: 0.62},
+      {start: 0.17, frequency: 1174.66, duration: 0.15, level: 0.72},
+      {start: 0.52, frequency: 880.00, duration: 0.13, level: 0.62},
+      {start: 0.69, frequency: 1174.66, duration: 0.18, level: 0.76}
+    ];
+
+    for (const event of events) {
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      const eventStart = now + event.start;
+      const eventEnd = eventStart + event.duration;
+
+      oscillator.type = "triangle";
+      oscillator.frequency.setValueAtTime(event.frequency, eventStart);
+
+      gain.gain.setValueAtTime(0.0001, eventStart);
+      gain.gain.exponentialRampToValueAtTime(
+        Math.max(0.0002, event.level * 0.18),
+        eventStart + 0.008
+      );
+      gain.gain.exponentialRampToValueAtTime(0.0001, eventEnd);
+
+      oscillator.connect(gain);
+      gain.connect(master);
+      state.urgentSources.push(oscillator);
+
+      oscillator.onended = () => {
+        state.urgentSources = state.urgentSources.filter(
+          item => item !== oscillator
+        );
+      };
+
+      oscillator.start(eventStart);
+      oscillator.stop(eventEnd + 0.02);
+    }
+
+    state.urgentLastPlayAt = Date.now();
+    return audioContext.state;
+  }
+
+  function stopUrgentLoop(clearStorage = true) {
+    if (state.urgentTimer) {
+      w.clearInterval(state.urgentTimer);
+      state.urgentTimer = null;
+    }
+
+    if (state.urgentWatchdog) {
+      w.clearInterval(state.urgentWatchdog);
+      state.urgentWatchdog = null;
+    }
+
+    state.urgentDialogId = null;
+    state.urgentLastPlayAt = 0;
+    stopUrgentSources();
+
+    if (clearStorage) {
+      w.localStorage.removeItem("mfr_active_dialog_id");
+      w.localStorage.removeItem("mfr_dialog_reminder_enabled");
+    }
+  }
+
+  async function startUrgentLoop(dialogId) {
+    if (!dialogId) return;
+
+    const storedDialogId = w.localStorage.getItem("mfr_active_dialog_id");
+
+    if (
+      state.urgentTimer
+      && state.urgentDialogId === dialogId
+      && storedDialogId === dialogId
+    ) {
+      return;
+    }
+
+    stopUrgentLoop(false);
+    state.urgentDialogId = dialogId;
+    w.localStorage.setItem("mfr_active_dialog_id", dialogId);
+    w.localStorage.setItem("mfr_dialog_reminder_enabled", "1");
+
+    const playIfActive = async () => {
+      const activeDialogId = w.localStorage.getItem("mfr_active_dialog_id");
+      const enabled =
+        w.localStorage.getItem("mfr_dialog_reminder_enabled") === "1";
+
+      if (
+        !enabled
+        || activeDialogId !== dialogId
+        || state.urgentDialogId !== dialogId
+      ) {
+        stopUrgentLoop(false);
+        return;
+      }
+
+      try {
+        await playUrgentOnce();
+        w.localStorage.removeItem("mfr_dialog_audio_error");
+      } catch (error) {
+        w.localStorage.setItem(
+          "mfr_dialog_audio_error",
+          `${error?.name || "AudioError"}: ${error?.message || String(error)}`
+        );
+      }
+    };
+
+    // ダイアログ表示直後に鳴らし、その後は約3秒ごとに催促する。
+    await playIfActive();
+    state.urgentTimer = w.setInterval(playIfActive, 3000);
+
+    // Edgeのタイマー停止・遅延時にも復旧する。
+    state.urgentWatchdog = w.setInterval(() => {
+      const activeDialogId = w.localStorage.getItem("mfr_active_dialog_id");
+      const enabled =
+        w.localStorage.getItem("mfr_dialog_reminder_enabled") === "1";
+      const elapsed = Date.now() - (state.urgentLastPlayAt || 0);
+
+      if (
+        enabled
+        && activeDialogId === dialogId
+        && state.urgentDialogId === dialogId
+        && elapsed >= 4200
+      ) {
+        playIfActive();
+      }
+    }, 1000);
   }
 
   async function playOnce() {
@@ -1079,11 +1483,26 @@ def render_monitor_activation():
       }, 4200);
     }
 
+    const activeDialogId = w.localStorage.getItem("mfr_active_dialog_id");
+    const dialogReminderEnabled =
+      w.localStorage.getItem("mfr_dialog_reminder_enabled") === "1";
+
+    if (dialogReminderEnabled && activeDialogId) {
+      w.setTimeout(() => {
+        startUrgentLoop(activeDialogId);
+      }, 1300);
+    }
+
     return contextState;
+  }
+
+  function stopAlert() {
+    stopLoop(true);
   }
 
   function stopAll() {
     stopLoop(true);
+    stopUrgentLoop(true);
   }
 
   w.__mfrCrystalEngine = {
@@ -1091,10 +1510,16 @@ def render_monitor_activation():
     activate,
     playOnce,
     startLoop,
+    stopAlert,
+    playUrgentOnce,
+    startUrgentLoop,
+    stopUrgentLoop,
     stopAll,
     getState: () => ({
       alertId: state.alertId,
       timerActive: Boolean(state.timer),
+      urgentDialogId: state.urgentDialogId,
+      urgentTimerActive: Boolean(state.urgentTimer),
       contextState:
         state.context
         ? state.context.state
@@ -1378,12 +1803,12 @@ def stop_browser_alarm():
     "mfr_alarm_loop_enabled"
   );
 
-  if (
-    window.__mfrCrystalEngine
-    && typeof window.__mfrCrystalEngine.stopAll
-      === "function"
-  ) {
-    window.__mfrCrystalEngine.stopAll();
+  if (window.__mfrCrystalEngine) {
+    if (typeof window.__mfrCrystalEngine.stopAlert === "function") {
+      window.__mfrCrystalEngine.stopAlert();
+    } else if (typeof window.__mfrCrystalEngine.stopAll === "function") {
+      window.__mfrCrystalEngine.stopAll();
+    }
   }
 
   if (window.__mfrNotification) {
@@ -1413,6 +1838,97 @@ def stop_browser_alarm():
 
     components.html(html, height=0, width=0)
 
+
+
+
+def start_dialog_reminder(dialog_id):
+    """確認ダイアログが開いている間、専用の催促音を繰り返す。"""
+    dialog_id_json = json.dumps(str(dialog_id), ensure_ascii=False)
+    launcher_code = f"""
+(() => {{
+  const dialogId = {dialog_id_json};
+  localStorage.setItem("mfr_active_dialog_id", dialogId);
+  localStorage.setItem("mfr_dialog_reminder_enabled", "1");
+
+  let attempts = 0;
+  const startWhenReady = () => {{
+    attempts += 1;
+    if (
+      window.__mfrCrystalEngine
+      && typeof window.__mfrCrystalEngine.startUrgentLoop === "function"
+    ) {{
+      // 確認ダイアログ中は通常アラート音と重ねず、催促音を優先する。
+      if (typeof window.__mfrCrystalEngine.stopAlert === "function") {{
+        window.__mfrCrystalEngine.stopAlert();
+      }}
+      window.__mfrCrystalEngine.startUrgentLoop(dialogId).catch((error) => {{
+        localStorage.setItem(
+          "mfr_dialog_audio_error",
+          `${{error?.name || "AudioError"}}: ${{error?.message || String(error)}}`
+        );
+      }});
+      return;
+    }}
+
+    if (attempts < 30) {{
+      window.setTimeout(startWhenReady, 200);
+    }}
+  }};
+
+  startWhenReady();
+}})();
+"""
+    launcher_code_js = json.dumps(launcher_code)
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const parentWindow = window.parent;
+          const launcherCode = {launcher_code_js};
+          const launcher = parentWindow.document.createElement("script");
+          launcher.textContent = launcherCode;
+          parentWindow.document.head.appendChild(launcher);
+          launcher.remove();
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def stop_dialog_reminder():
+    """ダイアログへの応答後、専用の催促音だけを停止する。"""
+    stop_code = r"""
+(() => {
+  localStorage.removeItem("mfr_active_dialog_id");
+  localStorage.removeItem("mfr_dialog_reminder_enabled");
+
+  if (
+    window.__mfrCrystalEngine
+    && typeof window.__mfrCrystalEngine.stopUrgentLoop === "function"
+  ) {
+    window.__mfrCrystalEngine.stopUrgentLoop(true);
+  }
+})();
+"""
+    stop_code_js = json.dumps(stop_code)
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const parentWindow = window.parent;
+          const stopCode = {stop_code_js};
+          const stopper = parentWindow.document.createElement("script");
+          stopper.textContent = stopCode;
+          parentWindow.document.head.appendChild(stopper);
+          stopper.remove();
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def get_measurement_text(num_targets, current_target_qty, targets):
@@ -2972,6 +3488,7 @@ def finish_production(machine, job_id):
     """最終測定後の確認で「はい」が選ばれた成型機を生産完了にする。"""
     job = st.session_state.jobs.get(machine)
     if job is None or job.get('job_id') != job_id:
+        stop_dialog_reminder()
         st.session_state.pending_production_finish_confirmation = None
         save_state()
         return
@@ -3028,12 +3545,14 @@ def render_measurement_required_before_finish_dialog():
     job = st.session_state.jobs.get(machine)
 
     if job is None or job.get('job_id') != job_id:
+        stop_dialog_reminder()
         st.session_state.pending_measurement_required_before_finish = None
         save_state()
         return
 
     missing_labels = get_missing_measurement_labels(job)
     if not missing_labels:
+        stop_dialog_reminder()
         st.session_state.pending_measurement_required_before_finish = None
         save_state()
         return
@@ -3058,6 +3577,7 @@ def render_measurement_required_before_finish_dialog():
         use_container_width=True,
         key=f"return_measurement_{machine}_{job_id}",
     ):
+        stop_dialog_reminder()
         st.session_state.pending_measurement_required_before_finish = None
         save_state()
         st.rerun()
@@ -3077,6 +3597,7 @@ def render_production_finish_confirmation_dialog():
 
     # すでに別Lotへ切り替わっている場合は古い確認を破棄する。
     if job is None or job.get('job_id') != job_id:
+        stop_dialog_reminder()
         st.session_state.pending_production_finish_confirmation = None
         save_state()
         return
@@ -3094,6 +3615,7 @@ def render_production_finish_confirmation_dialog():
             use_container_width=True,
             key=f"finish_yes_{machine}_{job_id}",
         ):
+            stop_dialog_reminder()
             finish_production(machine, job_id)
 
     with col_no:
@@ -3102,6 +3624,7 @@ def render_production_finish_confirmation_dialog():
             use_container_width=True,
             key=f"finish_no_{machine}_{job_id}",
         ):
+            stop_dialog_reminder()
             st.session_state.pending_production_finish_confirmation = None
             save_state()
             st.rerun()
@@ -3144,6 +3667,7 @@ def render_signboard_confirmation_dialog():
         use_container_width=True,
         key="confirm_signboard_written",
     ):
+        stop_dialog_reminder()
         st.session_state.pending_signboard_confirmation = None
         save_state()
         st.rerun()
@@ -3174,6 +3698,7 @@ def render_mfr_power_confirmation_dialog():
             use_container_width=True,
             key="confirm_mfr_power_on",
         ):
+            stop_dialog_reminder()
             finalize_production_start_with_actual_power(True)
 
     with col_off:
@@ -3182,6 +3707,7 @@ def render_mfr_power_confirmation_dialog():
             use_container_width=True,
             key="confirm_mfr_power_off",
         ):
+            stop_dialog_reminder()
             finalize_production_start_with_actual_power(False)
 
     if st.button(
@@ -3189,6 +3715,7 @@ def render_mfr_power_confirmation_dialog():
         use_container_width=True,
         key="cancel_pending_production_start",
     ):
+        stop_dialog_reminder()
         st.session_state.pending_production_start = None
         st.rerun()
 
@@ -3257,13 +3784,28 @@ else:
 
 
 if st.session_state.get('pending_signboard_confirmation'):
+    start_dialog_reminder("signboard_confirmation")
     show_signboard_confirmation_dialog()
 elif st.session_state.get('pending_measurement_required_before_finish'):
+    pending = st.session_state.get('pending_measurement_required_before_finish') or {}
+    start_dialog_reminder(
+        f"measurement_required_{pending.get('machine', '')}_{pending.get('job_id', '')}"
+    )
     show_measurement_required_before_finish_dialog()
 elif st.session_state.get('pending_production_finish_confirmation'):
+    pending = st.session_state.get('pending_production_finish_confirmation') or {}
+    start_dialog_reminder(
+        f"production_finish_{pending.get('machine', '')}_{pending.get('job_id', '')}"
+    )
     show_production_finish_confirmation_dialog()
 elif st.session_state.get('pending_production_start'):
+    pending = st.session_state.get('pending_production_start') or {}
+    start_dialog_reminder(
+        f"mfr_power_{pending.get('machine', '')}_{pending.get('product_name', '')}"
+    )
     show_mfr_power_confirmation_dialog()
+else:
+    stop_dialog_reminder()
 
 
 # --- UI：成型機コントロールパネル ---
@@ -4665,6 +5207,7 @@ with cost_tab_history:
 
     st.markdown("##### MFR電源実績")
     power_rows = []
+    excluded_week_keys = set(cost_data.get("excluded_weeks", []))
     for event in sorted(
         cost_data["power_events"],
         key=lambda item: str(item.get("actual_at", "")),
@@ -4672,6 +5215,11 @@ with cost_tab_history:
     ):
         actual_at = parse_history_datetime(event.get("actual_at"))
         scheduled_at = parse_history_datetime(event.get("scheduled_at"))
+        if (
+            actual_at is not None
+            and _week_start(actual_at).strftime("%Y-%m-%d") in excluded_week_keys
+        ):
+            continue
         power_rows.append({
             "実績日時": actual_at.strftime("%Y/%m/%d %H:%M") if actual_at else "",
             "操作": event.get("action", ""),
@@ -4686,6 +5234,138 @@ with cost_tab_history:
         )
     else:
         st.info("まだMFR電源ON/OFF実績はありません。")
+
+    st.markdown("---")
+    st.markdown("##### 🗑️ Cost Saving履歴の削除")
+    st.caption(
+        "削除後は日次・週次・累計・グラフを自動再計算し、クラウドにも反映します。"
+        "計算条件は削除されません。"
+    )
+
+    delete_mode = st.radio(
+        "削除方法",
+        ["個別削除", "週ごと全削除", "全削除"],
+        horizontal=True,
+        key="cost_delete_mode",
+    )
+
+    if delete_mode == "個別削除":
+        current_records = sorted(
+            cost_data["production_history"],
+            key=lambda record: str(record.get("ended_at", "")),
+            reverse=True,
+        )
+        if current_records:
+            record_map = {
+                str(record.get("job_id", "")): record
+                for record in current_records
+                if record.get("job_id")
+            }
+            selected_job_id = st.selectbox(
+                "削除する生産履歴",
+                options=list(record_map.keys()),
+                format_func=lambda job_id: (
+                    f"{(parse_history_datetime(record_map[job_id].get('ended_at')) or now_cost).strftime('%Y/%m/%d %H:%M')} ｜ "
+                    f"{record_map[job_id].get('machine', '')} ｜ "
+                    f"{record_map[job_id].get('product_name', '')} ｜ "
+                    f"{record_map[job_id].get('final_qty', 0)}個"
+                ),
+                key="cost_delete_job_select",
+            )
+            confirm_one = st.checkbox(
+                "選択した生産履歴1件を削除することを確認しました",
+                key="cost_delete_one_confirm",
+            )
+            if st.button(
+                "🗑️ 選択した1件を削除",
+                disabled=not confirm_one,
+                use_container_width=True,
+                key="cost_delete_one_button",
+            ):
+                if delete_cost_saving_production_record(selected_job_id):
+                    cloud_saved = save_cost_saving_history_change()
+                    if GITHUB_TOKEN and not cloud_saved:
+                        st.warning(
+                            "ローカルでは削除しましたが、クラウド同期に失敗しました。"
+                            "通信状態を確認して再度同期してください。"
+                        )
+                    else:
+                        st.success("選択した生産履歴を削除しました。集計を再計算します。")
+                    st.rerun()
+        else:
+            st.info("個別削除できる生産履歴はありません。")
+
+    elif delete_mode == "週ごと全削除":
+        history_weeks = get_cost_saving_history_weeks(cost_data)
+        if history_weeks:
+            week_map = {
+                week.strftime("%Y-%m-%d"): week
+                for week in history_weeks
+            }
+            selected_week_key = st.selectbox(
+                "削除する週",
+                options=list(week_map.keys()),
+                format_func=lambda key: format_cost_saving_week_label(week_map[key]),
+                key="cost_delete_week_select",
+            )
+            st.warning(
+                "選択した週の生産履歴と、その週のCost Saving効果をすべて削除します。"
+                "MFR電源ON/OFFの内部時系列は、前後週の計算を壊さないため保持しますが、"
+                "選択週の表示・集計からは除外されます。"
+            )
+            confirm_week = st.checkbox(
+                "選択した週をすべて削除することを確認しました",
+                key="cost_delete_week_confirm",
+            )
+            if st.button(
+                "🗑️ 選択した週を全削除",
+                disabled=not confirm_week,
+                use_container_width=True,
+                key="cost_delete_week_button",
+            ):
+                if delete_cost_saving_week(week_map[selected_week_key]):
+                    cloud_saved = save_cost_saving_history_change()
+                    if GITHUB_TOKEN and not cloud_saved:
+                        st.warning(
+                            "ローカルでは週削除しましたが、クラウド同期に失敗しました。"
+                        )
+                    else:
+                        st.success("選択した週を削除しました。集計を再計算します。")
+                    st.rerun()
+        else:
+            st.info("週単位で削除できる実績はありません。")
+
+    else:
+        st.error(
+            "Cost Savingの生産履歴・MFR電源実績をすべて削除します。"
+            "この操作は元に戻せません。計算条件のみ残ります。"
+        )
+        confirm_all_1 = st.checkbox(
+            "全履歴を削除することを理解しました",
+            key="cost_delete_all_confirm_1",
+        )
+        confirm_all_2 = st.checkbox(
+            "本当にすべて削除します",
+            key="cost_delete_all_confirm_2",
+        )
+        if st.button(
+            "🗑️ Cost Saving履歴をすべて削除",
+            type="primary",
+            disabled=not (confirm_all_1 and confirm_all_2),
+            use_container_width=True,
+            key="cost_delete_all_button",
+        ):
+            if delete_all_cost_saving_history():
+                cloud_saved = save_cost_saving_history_change()
+                if GITHUB_TOKEN and not cloud_saved:
+                    st.warning(
+                        "ローカルでは全削除しましたが、クラウド同期に失敗しました。"
+                    )
+                else:
+                    st.success("Cost Saving履歴をすべて削除しました。")
+                st.rerun()
+            else:
+                st.info("削除対象の履歴はありません。")
 
 with cost_tab_settings:
     st.write(
@@ -4783,3 +5463,4 @@ with cost_tab_settings:
         st.caption(
             "GitHubトークンが設定されていないため、現在はローカル保存です。"
         )
+
