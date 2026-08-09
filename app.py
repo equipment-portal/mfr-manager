@@ -1,3 +1,4 @@
+# Version 1.6.25: 通知時の最上部スクロールをStreamlit内部スクロール領域まで確実に戻す方式へ修正
 # Version 1.6.24: 測定記録未入力時の10分後フォロー通知・新規アラート時はページ最上部へ自動スクロール
 # Version 1.6.23: MFR測定記録後のOFF通知を即時化・次にやることへ即時OFFを反映・過去予定によるOFF取消を防止
 # Version 1.6.22: 実機MFRが測定可能済みなら新規Lotの「始」を即時測定にする判定を追加
@@ -787,7 +788,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.24"
+APP_VERSION = "1.6.25"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -1946,39 +1947,117 @@ def scroll_to_active_alert(alert_id):
     """
     新しいアラートが発生した瞬間だけ、親Edge画面をページ最上部へ戻す。
 
-    システム名・現在時刻・通知欄をまとめて視認できるようにする。
-    10秒ごとの自動更新で同じアラートへ何度も引き戻さないよう、
-    最後に自動スクロールしたアラートIDをlocalStorageへ保存する。
+    Streamlitではwindow自体ではなく[data-testid="stMain"]等の内部要素が
+    スクロールコンテナになる場合があるため、ページ上端アンカーへの
+    scrollIntoViewと、候補スクロール要素のscrollTop=0を併用する。
+
+    実際に上端へ戻ったことを確認してからアラートIDをlocalStorageへ保存し、
+    失敗した場合は短時間再試行する。
     """
     alert_id_json = json.dumps(str(alert_id), ensure_ascii=False)
     scroll_code = f"""
 (() => {{
   const alertId = {alert_id_json};
-  const storageKey = "mfr_last_auto_scrolled_alert_id_v1_6_24";
+  const storageKey = "mfr_last_auto_scrolled_alert_id_v1_6_25";
 
   if (localStorage.getItem(storageKey) === alertId) {{
     return;
   }}
 
   let attempts = 0;
-  const scrollWhenReady = () => {{
-    attempts += 1;
 
-    try {{
-      window.scrollTo({{
-        top: 0,
-        left: 0,
-        behavior: "smooth"
-      }});
-      document.documentElement.scrollTop = 0;
-      document.body.scrollTop = 0;
-      localStorage.setItem(storageKey, alertId);
-      return;
-    }} catch (error) {{
-      if (attempts < 40) {{
-        window.setTimeout(scrollWhenReady, 100);
+  const getScrollCandidates = () => {{
+    const selectors = [
+      '[data-testid="stMain"]',
+      '.stMain',
+      'section.main',
+      '[data-testid="stAppViewContainer"]',
+      '.main'
+    ];
+
+    const candidates = [];
+    for (const selector of selectors) {{
+      const element = document.querySelector(selector);
+      if (element && !candidates.includes(element)) {{
+        candidates.push(element);
       }}
     }}
+
+    if (document.scrollingElement && !candidates.includes(document.scrollingElement)) {{
+      candidates.push(document.scrollingElement);
+    }}
+    if (document.documentElement && !candidates.includes(document.documentElement)) {{
+      candidates.push(document.documentElement);
+    }}
+    if (document.body && !candidates.includes(document.body)) {{
+      candidates.push(document.body);
+    }}
+
+    return candidates;
+  }};
+
+  const forceTop = () => {{
+    const topAnchor = document.getElementById('mfr-page-top-anchor');
+
+    if (topAnchor && typeof topAnchor.scrollIntoView === 'function') {{
+      try {{
+        topAnchor.scrollIntoView({{
+          behavior: 'auto',
+          block: 'start',
+          inline: 'nearest'
+        }});
+      }} catch (error) {{}}
+    }}
+
+    try {{
+      window.scrollTo(0, 0);
+    }} catch (error) {{}}
+
+    for (const element of getScrollCandidates()) {{
+      try {{
+        if (typeof element.scrollTo === 'function') {{
+          element.scrollTo({{ top: 0, left: 0, behavior: 'auto' }});
+        }}
+        element.scrollTop = 0;
+      }} catch (error) {{}}
+    }}
+  }};
+
+  const isAtTop = () => {{
+    const topAnchor = document.getElementById('mfr-page-top-anchor');
+    if (topAnchor) {{
+      const rect = topAnchor.getBoundingClientRect();
+      if (rect.top >= -8 && rect.top <= 120) {{
+        return true;
+      }}
+    }}
+
+    const candidates = getScrollCandidates();
+    return candidates.some((element) => {{
+      try {{
+        return Math.abs(Number(element.scrollTop || 0)) <= 5;
+      }} catch (error) {{
+        return false;
+      }}
+    }});
+  }};
+
+  const scrollWhenReady = () => {{
+    attempts += 1;
+    forceTop();
+
+    window.setTimeout(() => {{
+      forceTop();
+
+      if (isAtTop()) {{
+        localStorage.setItem(storageKey, alertId);
+        return;
+      }}
+
+      if (attempts < 30) {{
+        window.setTimeout(scrollWhenReady, 120);
+      }}
+    }}, 80);
   }};
 
   scrollWhenReady();
@@ -3145,6 +3224,11 @@ active_alerts.sort(key=lambda item: item["due"])
 
 
 # --- UI：ヘッダー（QRシステムと同じサイズ感に統一） ---
+# 通知発生時にページ最上部へ確実に戻すための専用アンカー。
+st.markdown(
+    '<div id="mfr-page-top-anchor" style="height:1px; margin:0; padding:0; scroll-margin-top:0;"></div>',
+    unsafe_allow_html=True,
+)
 try:
     logo_base64 = get_image_base64(logo_path)
     logo_html = f"""
