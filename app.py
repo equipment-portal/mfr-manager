@@ -1,3 +1,5 @@
+# Version 1.6.24: 測定記録未入力時の10分後フォロー通知・新規アラート時はページ最上部へ自動スクロール
+# Version 1.6.23: MFR測定記録後のOFF通知を即時化・次にやることへ即時OFFを反映・過去予定によるOFF取消を防止
 # Version 1.6.22: 実機MFRが測定可能済みなら新規Lotの「始」を即時測定にする判定を追加
 # Version 1.6.21: 新規アラート発生時に通知欄へ自動スクロール・生産終了後は自動で停止中へ戻す
 # Version 1.6.20: Cost Saving週次グラフを6週固定枠表示・未実績の将来週も週枠と週ラベルを先行表示
@@ -785,7 +787,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.22"
+APP_VERSION = "1.6.24"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -1942,8 +1944,9 @@ def stop_dialog_reminder():
 
 def scroll_to_active_alert(alert_id):
     """
-    新しいアラートが発生した瞬間だけ、親Edge画面の通知欄へ自動スクロールする。
+    新しいアラートが発生した瞬間だけ、親Edge画面をページ最上部へ戻す。
 
+    システム名・現在時刻・通知欄をまとめて視認できるようにする。
     10秒ごとの自動更新で同じアラートへ何度も引き戻さないよう、
     最後に自動スクロールしたアラートIDをlocalStorageへ保存する。
     """
@@ -1951,7 +1954,7 @@ def scroll_to_active_alert(alert_id):
     scroll_code = f"""
 (() => {{
   const alertId = {alert_id_json};
-  const storageKey = "mfr_last_auto_scrolled_alert_id";
+  const storageKey = "mfr_last_auto_scrolled_alert_id_v1_6_24";
 
   if (localStorage.getItem(storageKey) === alertId) {{
     return;
@@ -1960,25 +1963,21 @@ def scroll_to_active_alert(alert_id):
   let attempts = 0;
   const scrollWhenReady = () => {{
     attempts += 1;
-    const target = document.getElementById("mfr-active-alert-anchor");
 
-    if (target) {{
-      try {{
-        target.scrollIntoView({{
-          behavior: "smooth",
-          block: "start",
-          inline: "nearest"
-        }});
-        localStorage.setItem(storageKey, alertId);
-      }} catch (error) {{
-        window.scrollTo({{top: 0, behavior: "smooth"}});
-        localStorage.setItem(storageKey, alertId);
-      }}
+    try {{
+      window.scrollTo({{
+        top: 0,
+        left: 0,
+        behavior: "smooth"
+      }});
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+      localStorage.setItem(storageKey, alertId);
       return;
-    }}
-
-    if (attempts < 40) {{
-      window.setTimeout(scrollWhenReady, 100);
+    }} catch (error) {{
+      if (attempts < 40) {{
+        window.setTimeout(scrollWhenReady, 100);
+      }}
     }}
   }};
 
@@ -2690,11 +2689,12 @@ def complete_mfr_measurement(machine, target_qty):
                 'measured_at': now_jst.isoformat(timespec='seconds'),
             })
 
-    # 実際の測定完了から10分後に電源OFF候補を作成。
-    # 90分以内に次の測定がある場合は、次回更新時に自動取消する。
-    st.session_state.pending_power_off_due = (
-        now_jst + timedelta(minutes=10)
-    )
+    # このボタンは「MFR測定が完了した後」に押すため、
+    # 押下時点＝実際の測定完了時刻として扱う。
+    # 次の測定・点検まで十分な空き時間がある場合は、
+    # 追加で10分待たず、その場で電源OFFアラートを出す。
+    # 90分以内に次の測定・点検がある場合は、次回更新時に自動取消する。
+    st.session_state.pending_power_off_due = now_jst
     measurement_label = get_measurement_text(
         len(job.get('targets', [])),
         target_qty,
@@ -2763,10 +2763,14 @@ def undo_mfr_measurement(machine, target_qty):
     # 同じ測定の確認履歴を取り消し、必要なら再通知できるようにする。
     job_id = job.get('job_id', machine)
     measurement_alert_id = f"MEAS_{job_id}_{target_qty}"
+    measurement_reminder_id = f"MEAS_REMINDER_{job_id}_{target_qty}"
     st.session_state.acknowledged_alerts = [
         alert_id
         for alert_id in st.session_state.acknowledged_alerts
-        if str(alert_id) != measurement_alert_id
+        if str(alert_id) not in (
+            measurement_alert_id,
+            measurement_reminder_id,
+        )
     ]
 
     # 誤完了によって作られた10分後のOFF予約を解除する。
@@ -2838,6 +2842,13 @@ def get_next_power_action(reference_time):
     """
     power_is_on = bool(st.session_state.get('mfr_power_is_on', False))
 
+    # 測定・点検完了後にOFF待ちがある場合は、
+    # タイムライン上の未来のON予定よりも実際の次操作を優先する。
+    # 測定記録ボタン押下時点でOFF可能なら「今すぐOFF」を表示する。
+    pending_off = st.session_state.get('pending_power_off_due')
+    if power_is_on and isinstance(pending_off, datetime):
+        return 'OFF', pending_off
+
     # 現在時刻が赤いONバーの中にいる場合：
     # 実機ONなら次はバー終端でOFF、実機OFFならON予定を過ぎているので今すぐON。
     active_blocks = sorted(
@@ -2851,12 +2862,6 @@ def get_next_power_action(reference_time):
     if active_blocks:
         block_start, block_end = active_blocks[0]
         if power_is_on:
-            pending_off = st.session_state.get('pending_power_off_due')
-            if (
-                isinstance(pending_off, datetime)
-                and reference_time <= pending_off <= block_end
-            ):
-                return 'OFF', pending_off
             return 'OFF', block_end
         return 'ON', block_start
 
@@ -2913,18 +2918,82 @@ for pt in valid_upcoming:
         alert_id_meas = f"MEAS_{job_id}_{pt['target_qty']}"
 
         if alert_id_meas not in st.session_state.acknowledged_alerts:
-            active_alerts.append({
-                "id": alert_id_meas,
-                "due": m_time,
-                "title": "🎯 MFR測定アラート",
-                "message": (
-                    f"{pt['machine']} 成型機（{meas_text}）のMFR測定時刻です。"
-                    f" 予定時刻：{m_time.strftime('%m/%d %H:%M')}"
-                ),
-                "kind": "measurement",
-                "machine": pt['machine'],
-                "target_qty": pt['target_qty'],
-            })
+            elapsed_from_due = now - m_time
+
+            if elapsed_from_due >= timedelta(minutes=10):
+                # 測定予定から10分経っても記録されていない場合は、
+                # 「測定記録忘れ」を明確にした新しいフォロー通知へ切り替える。
+                # IDを別にすることで、通知音・Windows通知・自動スクロールも
+                # 10分後に改めて発生させる。
+                reminder_id = (
+                    f"MEAS_REMINDER_{job_id}_{pt['target_qty']}"
+                )
+
+                future_items = [
+                    item for item in valid_upcoming
+                    if item.get('est_time') is not None
+                    and not (
+                        item['machine'] == pt['machine']
+                        and item['target_qty'] == pt['target_qty']
+                    )
+                    and item['est_time'] > now
+                ]
+                future_items.sort(key=lambda item: item['est_time'])
+                next_item = future_items[0] if future_items else None
+
+                if next_item is not None:
+                    remaining_minutes = max(
+                        1,
+                        int(math.ceil(
+                            (next_item['est_time'] - now).total_seconds()
+                            / 60
+                        )),
+                    )
+                    if remaining_minutes > 90:
+                        followup_action = (
+                            f"次の測定・点検まで"
+                            f"{format_remaining_time(remaining_minutes)}あるため、"
+                            "測定記録後にMFR測定器の電源をOFFにしてください。"
+                        )
+                    else:
+                        followup_action = (
+                            f"次の測定・点検まで"
+                            f"{format_remaining_time(remaining_minutes)}です。"
+                            "測定記録を確実に行ってください。"
+                        )
+                else:
+                    followup_action = (
+                        "次の測定・点検予定がないため、測定記録後に"
+                        "MFR測定器の電源をOFFにしてください。"
+                    )
+
+                active_alerts.append({
+                    "id": reminder_id,
+                    "due": m_time + timedelta(minutes=10),
+                    "title": "⏰ MFR測定記録アラート",
+                    "message": (
+                        f"{pt['machine']} 成型機（{meas_text}）の測定予定から"
+                        "10分経過しました。測定が完了している場合は、"
+                        "下の［測定済みとして記録］を押してください。 "
+                        f"{followup_action}"
+                    ),
+                    "kind": "measurement",
+                    "machine": pt['machine'],
+                    "target_qty": pt['target_qty'],
+                })
+            else:
+                active_alerts.append({
+                    "id": alert_id_meas,
+                    "due": m_time,
+                    "title": "🎯 MFR測定アラート",
+                    "message": (
+                        f"{pt['machine']} 成型機（{meas_text}）のMFR測定時刻です。"
+                        f" 予定時刻：{m_time.strftime('%m/%d %H:%M')}"
+                    ),
+                    "kind": "measurement",
+                    "machine": pt['machine'],
+                    "target_qty": pt['target_qty'],
+                })
 
 # 3. 電源ON・OFF
 # on_blocks の終了時刻には、最終測定後10分の冷却時間を含めています。
@@ -2995,13 +3064,20 @@ for b_start, b_off in on_blocks:
                 "kind": "power_on",
             })
 
-# 4. 実際の測定・点検完了から10分後の電源OFF
+# 4. 実際の測定完了後、次予定が遠ければ即時電源OFF
 pending_off_due = st.session_state.pending_power_off_due
 if pending_off_due is not None:
-    # 未完了の測定が90分以内に残る場合は、電源を維持するためOFF予約を取り消す
-    completion_time = pending_off_due - timedelta(minutes=10)
+    # 未完了の測定・点検が「完了時刻より後、90分以内」に残る場合だけ、
+    # 電源を維持するためOFF予約を取り消す。
+    # 過去時刻の未完了予定が残っていてもOFF判断を邪魔させない。
+    off_context = st.session_state.get('pending_power_off_context') or {}
+    completion_time = off_context.get('completed_at')
+    if not isinstance(completion_time, datetime):
+        completion_time = pending_off_due
+
     keep_power_on = any(
         item['est_time'] is not None
+        and completion_time < item['est_time']
         and item['est_time'] <= completion_time + timedelta(minutes=90)
         for item in valid_upcoming
     )
@@ -3011,9 +3087,13 @@ if pending_off_due is not None:
         st.session_state.pending_power_off_context = None
         save_state()
     elif now >= pending_off_due:
-        alert_id_off = f"OFF_ACTUAL_{pending_off_due.strftime('%Y%m%d_%H%M')}"
+        off_context = st.session_state.get('pending_power_off_context') or {}
+        off_source_key = str(off_context.get('machine') or off_context.get('type') or 'MFR')
+        off_source_key = ''.join(ch for ch in off_source_key if ch.isalnum() or ch in ('-', '_'))
+        alert_id_off = (
+            f"OFF_ACTUAL_{pending_off_due.strftime('%Y%m%d_%H%M%S')}_{off_source_key}"
+        )
         if alert_id_off not in st.session_state.acknowledged_alerts:
-            off_context = st.session_state.get('pending_power_off_context') or {}
             context_type = off_context.get('type')
 
             if context_type == 'measurement':
