@@ -1,3 +1,6 @@
+# Version 1.6.12: Cost Saving実績管理を追加（生産/電源履歴・週次/日次効果・GitHub自動保存）
+# Version 1.6.11: ヘッダーへVer表示を追加・成型中/生産終了バッジを大型化・成型中アイコンを回転矢印へ変更
+# Version 1.6.10: 「次にやること」のMFR測定表示を「始／中／終 測定」に統一
 # Version 1.6.9: 「次にやること」をタイムラインのONバーと完全同期・電源操作と測定を時刻順に左右自動並べ替え
 # Version 1.6.8: 今後予定を「次の電源操作・次のMFR測定」に集約／電源OFF確認後に表示札記入確認ダイアログ
 # Version 1.6.7: 色弱でも判別しやすい配色へ全面調整（青=正常/完了、黄橙=要操作、赤=アラート、灰=停止）
@@ -89,10 +92,452 @@ def save_products_to_github(products_dict):
     except Exception as e:
         print("GitHubセーブエラー:", e)
 
+
+# --- Cost Saving 実績・クラウド保存 ---
+COST_SAVING_FILE = "mfr_cost_saving_history.json"
+
+DEFAULT_COST_SAVING_SETTINGS = {
+    "power_kw": 0.80,
+    "electricity_price": 25.0,
+    "labor_hourly_rate": 4600.0,
+    "manual_minutes_per_lot": 5.0,
+    "maintenance_cost": 0.0,
+    "maintenance_life_hours": 0.0,
+}
+
+
+def get_default_cost_saving_data():
+    return {
+        "schema_version": 1,
+        "settings": dict(DEFAULT_COST_SAVING_SETTINGS),
+        "production_history": [],
+        "power_events": [],
+    }
+
+
+def normalize_cost_saving_data(data):
+    base = get_default_cost_saving_data()
+    if not isinstance(data, dict):
+        return base
+
+    settings = dict(DEFAULT_COST_SAVING_SETTINGS)
+    raw_settings = data.get("settings", {})
+    if isinstance(raw_settings, dict):
+        settings.update(raw_settings)
+
+    production_history = data.get("production_history", [])
+    if not isinstance(production_history, list):
+        production_history = []
+
+    power_events = data.get("power_events", [])
+    if not isinstance(power_events, list):
+        power_events = []
+
+    return {
+        "schema_version": 1,
+        "settings": settings,
+        "production_history": production_history,
+        "power_events": power_events,
+    }
+
+
+def load_cost_saving_from_github():
+    if not GITHUB_TOKEN:
+        return None
+    try:
+        api_url = (
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/"
+            f"{COST_SAVING_FILE}"
+        )
+        req = urllib.request.Request(api_url)
+        req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        with urllib.request.urlopen(req, timeout=10) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            return normalize_cost_saving_data(json.loads(content))
+    except Exception:
+        return None
+
+
+def _merge_history_by_key(remote_items, local_items, key_name):
+    merged = {}
+    for item in (remote_items or []):
+        if isinstance(item, dict) and item.get(key_name):
+            merged[str(item[key_name])] = item
+    for item in (local_items or []):
+        if isinstance(item, dict) and item.get(key_name):
+            merged[str(item[key_name])] = item
+    return list(merged.values())
+
+
+def merge_cost_saving_data(remote_data, local_data, prefer_local_settings=True):
+    remote = normalize_cost_saving_data(remote_data)
+    local = normalize_cost_saving_data(local_data)
+
+    if prefer_local_settings:
+        settings = dict(remote["settings"])
+        settings.update(local["settings"])
+    else:
+        settings = dict(local["settings"])
+        settings.update(remote["settings"])
+
+    return {
+        "schema_version": 1,
+        "settings": settings,
+        "production_history": _merge_history_by_key(
+            remote["production_history"],
+            local["production_history"],
+            "job_id",
+        ),
+        "power_events": _merge_history_by_key(
+            remote["power_events"],
+            local["power_events"],
+            "event_id",
+        ),
+    }
+
+
+def save_cost_saving_to_github(cost_data):
+    if not GITHUB_TOKEN:
+        return False
+
+    try:
+        api_url = (
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/"
+            f"{COST_SAVING_FILE}"
+        )
+
+        sha = None
+        try:
+            req_check = urllib.request.Request(api_url)
+            req_check.add_header("Authorization", f"token {GITHUB_TOKEN}")
+            with urllib.request.urlopen(req_check, timeout=10) as res:
+                sha = json.loads(res.read().decode("utf-8")).get("sha")
+        except Exception:
+            pass
+
+        encoded = base64.b64encode(
+            json.dumps(
+                normalize_cost_saving_data(cost_data),
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+        ).decode("utf-8")
+
+        payload = {
+            "message": "Update MFR Cost Saving History",
+            "content": encoded,
+            "branch": "main",
+        }
+        if sha:
+            payload["sha"] = sha
+
+        req = urllib.request.Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="PUT",
+        )
+        req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+        return True
+    except Exception as e:
+        print("Cost Saving GitHubセーブエラー:", e)
+        return False
+
+
+def sync_cost_saving_to_github():
+    """ローカル履歴とGitHub履歴をID単位で統合して保存する。"""
+    if not GITHUB_TOKEN:
+        return False
+
+    local_data = normalize_cost_saving_data(
+        st.session_state.get("cost_saving_data")
+    )
+    remote_data = load_cost_saving_from_github()
+    merged = merge_cost_saving_data(
+        remote_data,
+        local_data,
+        prefer_local_settings=True,
+    )
+    st.session_state.cost_saving_data = merged
+    return save_cost_saving_to_github(merged)
+
+
+def parse_history_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_cost_saving_settings_snapshot():
+    data = normalize_cost_saving_data(
+        st.session_state.get("cost_saving_data")
+    )
+    return dict(data["settings"])
+
+
+def record_power_event(action, actual_time, alert_id, scheduled_time=None):
+    """実際に確認されたMFR電源ON/OFFを重複なく記録する。"""
+    if action not in ("ON", "OFF") or not isinstance(actual_time, datetime):
+        return False
+
+    data = normalize_cost_saving_data(
+        st.session_state.get("cost_saving_data")
+    )
+    event_id = str(alert_id)
+    if any(
+        str(event.get("event_id")) == event_id
+        for event in data["power_events"]
+        if isinstance(event, dict)
+    ):
+        st.session_state.cost_saving_data = data
+        return False
+
+    data["power_events"].append({
+        "event_id": event_id,
+        "action": action,
+        "actual_at": actual_time.isoformat(timespec="seconds"),
+        "scheduled_at": (
+            scheduled_time.isoformat(timespec="seconds")
+            if isinstance(scheduled_time, datetime)
+            else None
+        ),
+        "settings": get_cost_saving_settings_snapshot(),
+    })
+    st.session_state.cost_saving_data = data
+    return True
+
+
+def archive_production_job(machine, job, ended_at, completion_type):
+    """終了したLotをCost Saving生産履歴へ1回だけ保存する。"""
+    if not isinstance(job, dict) or not job.get("job_id"):
+        return False
+
+    data = normalize_cost_saving_data(
+        st.session_state.get("cost_saving_data")
+    )
+    job_id = str(job["job_id"])
+    if any(
+        str(record.get("job_id")) == job_id
+        for record in data["production_history"]
+        if isinstance(record, dict)
+    ):
+        st.session_state.cost_saving_data = data
+        return False
+
+    settings = get_cost_saving_settings_snapshot()
+    labor_rate = max(0.0, float(settings.get("labor_hourly_rate", 0) or 0))
+    manual_minutes = max(
+        0.0,
+        float(settings.get("manual_minutes_per_lot", 0) or 0),
+    )
+    labor_saving_yen = manual_minutes / 60.0 * labor_rate
+
+    started_at = job.get("production_started_at")
+    if not isinstance(started_at, datetime):
+        started_at = parse_history_datetime(started_at)
+    if not isinstance(started_at, datetime):
+        started_at = job.get("last_update")
+    if not isinstance(started_at, datetime):
+        started_at = ended_at
+
+    measurement_records = []
+    for item in job.get("measurement_records", []):
+        if isinstance(item, dict):
+            measurement_records.append(dict(item))
+
+    data["production_history"].append({
+        "job_id": job_id,
+        "machine": machine,
+        "product_name": job.get("product_name", ""),
+        "total_qty": int(job.get("total_qty", 0) or 0),
+        "final_qty": int(job.get("current_qty", 0) or 0),
+        "cycle_time": float(job.get("cycle_time", 0) or 0),
+        "measurement_count": len(job.get("targets", [])),
+        "measurement_completed_count": len(job.get("completed", [])),
+        "measurement_records": measurement_records,
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "ended_at": ended_at.isoformat(timespec="seconds"),
+        "completion_type": completion_type,
+        "labor_saving_yen": round(labor_saving_yen, 2),
+        "settings": settings,
+    })
+    st.session_state.cost_saving_data = data
+    return True
+
+
+def build_power_off_intervals(power_events, now_jst):
+    """OFF確認から次のON確認までを削減通電時間として返す。"""
+    events = []
+    for event in power_events or []:
+        if not isinstance(event, dict):
+            continue
+        actual_at = parse_history_datetime(event.get("actual_at"))
+        if actual_at is None:
+            continue
+        action = str(event.get("action", "")).upper()
+        if action not in ("ON", "OFF"):
+            continue
+        events.append((actual_at, action, event))
+
+    events.sort(key=lambda row: row[0])
+    intervals = []
+    open_off = None
+
+    for actual_at, action, event in events:
+        if action == "OFF":
+            if open_off is None:
+                open_off = (actual_at, event)
+        elif action == "ON" and open_off is not None:
+            off_at, off_event = open_off
+            if actual_at > off_at:
+                intervals.append({
+                    "start": off_at,
+                    "end": actual_at,
+                    "settings": dict(
+                        off_event.get("settings")
+                        or DEFAULT_COST_SAVING_SETTINGS
+                    ),
+                    "open": False,
+                })
+            open_off = None
+
+    if open_off is not None:
+        off_at, off_event = open_off
+        if now_jst > off_at:
+            intervals.append({
+                "start": off_at,
+                "end": now_jst,
+                "settings": dict(
+                    off_event.get("settings")
+                    or DEFAULT_COST_SAVING_SETTINGS
+                ),
+                "open": True,
+            })
+
+    return intervals
+
+
+def _week_start(dt_value):
+    return (dt_value - timedelta(days=dt_value.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+
+def _add_effect(bucket, key, **values):
+    row = bucket.setdefault(key, {
+        "saved_hours": 0.0,
+        "saved_kwh": 0.0,
+        "electricity_yen": 0.0,
+        "labor_yen": 0.0,
+        "maintenance_yen": 0.0,
+        "lots": 0,
+    })
+    for name, value in values.items():
+        row[name] = row.get(name, 0) + value
+
+
+def _split_power_interval_into_buckets(interval, bucket, mode):
+    cursor = interval["start"]
+    end = interval["end"]
+    settings = dict(DEFAULT_COST_SAVING_SETTINGS)
+    settings.update(interval.get("settings") or {})
+
+    power_kw = max(0.0, float(settings.get("power_kw", 0) or 0))
+    elec_price = max(
+        0.0,
+        float(settings.get("electricity_price", 0) or 0),
+    )
+    maintenance_cost = max(
+        0.0,
+        float(settings.get("maintenance_cost", 0) or 0),
+    )
+    maintenance_life = max(
+        0.0,
+        float(settings.get("maintenance_life_hours", 0) or 0),
+    )
+    maintenance_per_hour = (
+        maintenance_cost / maintenance_life
+        if maintenance_cost > 0 and maintenance_life > 0
+        else 0.0
+    )
+
+    while cursor < end:
+        if mode == "day":
+            key = cursor.replace(hour=0, minute=0, second=0, microsecond=0)
+            boundary = key + timedelta(days=1)
+        else:
+            key = _week_start(cursor)
+            boundary = key + timedelta(days=7)
+
+        segment_end = min(end, boundary)
+        hours = max(
+            0.0,
+            (segment_end - cursor).total_seconds() / 3600.0,
+        )
+        kwh = hours * power_kw
+        _add_effect(
+            bucket,
+            key,
+            saved_hours=hours,
+            saved_kwh=kwh,
+            electricity_yen=kwh * elec_price,
+            maintenance_yen=hours * maintenance_per_hour,
+        )
+        cursor = segment_end
+
+
+def build_cost_saving_summary(cost_data, now_jst):
+    data = normalize_cost_saving_data(cost_data)
+    daily = {}
+    weekly = {}
+
+    intervals = build_power_off_intervals(
+        data["power_events"],
+        now_jst,
+    )
+    for interval in intervals:
+        _split_power_interval_into_buckets(interval, daily, "day")
+        _split_power_interval_into_buckets(interval, weekly, "week")
+
+    for record in data["production_history"]:
+        if not isinstance(record, dict):
+            continue
+        ended_at = parse_history_datetime(record.get("ended_at"))
+        if ended_at is None:
+            continue
+        labor_yen = max(
+            0.0,
+            float(record.get("labor_saving_yen", 0) or 0),
+        )
+        day_key = ended_at.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_key = _week_start(ended_at)
+        _add_effect(daily, day_key, labor_yen=labor_yen, lots=1)
+        _add_effect(weekly, week_key, labor_yen=labor_yen, lots=1)
+
+    return daily, weekly, intervals
+
+
+def effect_total_yen(row):
+    return (
+        float(row.get("electricity_yen", 0) or 0)
+        + float(row.get("labor_yen", 0) or 0)
+        + float(row.get("maintenance_yen", 0) or 0)
+    )
+
 # ページ設定
 logo_path = "logo.png" 
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
+
+APP_VERSION = "1.6.12"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -146,6 +591,10 @@ def save_state():
         # 電源OFF確認後の「次回ON予定を表示札へ記入」確認待ち。
         'pending_signboard_confirmation': st.session_state.get(
             'pending_signboard_confirmation'
+        ),
+        # Cost Savingの生産履歴・電源実績・計算条件。
+        'cost_saving_data': normalize_cost_saving_data(
+            st.session_state.get('cost_saving_data')
         ),
         # 作業者が確認した実際のMFR電源状態。
         # ON確認後は、OFF確認されるまで再度ONアラートを出さない。
@@ -1156,19 +1605,46 @@ st.markdown(
     .machine-status-badge {
         display: inline-flex;
         align-items: center;
-        gap: 0.45rem;
-        padding: 0.34rem 0.78rem;
+        justify-content: center;
+        gap: 0.82rem;
+        padding: 0.78rem 1.35rem;
+        min-height: 68px;
+        border-radius: 6px;
+        font-size: clamp(1.45rem, 1.05rem + 1.0vw, 2.05rem);
+        font-weight: 900;
+        margin: 0.08rem 0 0.55rem 0;
+        line-height: 1.05;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+    }
+
+    .machine-status-icon-circle {
+        width: 2.1rem;
+        height: 2.1rem;
+        min-width: 2.1rem;
         border-radius: 999px;
-        font-size: 1.03rem;
-        font-weight: 800;
-        margin: 0.05rem 0 0.35rem 0;
-        line-height: 1.2;
+        background: #ffffff;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.35rem;
+        font-weight: 900;
+        line-height: 1;
+        flex-shrink: 0;
+    }
+
+    .machine-status-label {
+        display: inline-block;
+        letter-spacing: 0.01em;
     }
 
     .machine-running-badge {
-        background: #dbeafe;
-        border: 3px solid #2563eb;
-        color: #0b3b8c;
+        background: #ff1717;
+        border: 3px solid #111827;
+        color: #ffffff;
+    }
+
+    .machine-running-badge .machine-status-icon-circle {
+        color: #1d4ed8;
     }
 
     .machine-paused-badge {
@@ -1177,16 +1653,28 @@ st.markdown(
         color: #6b3a00;
     }
 
+    .machine-paused-badge .machine-status-icon-circle {
+        color: #d97706;
+    }
+
     .machine-completed-badge {
-        background: #e0f2fe;
-        border: 3px solid #0369a1;
-        color: #075985;
+        background: #5b9bd5;
+        border: 3px solid #0f2d57;
+        color: #ffffff;
+    }
+
+    .machine-completed-badge .machine-status-icon-circle {
+        color: #2563eb;
     }
 
     .machine-idle-badge {
         background: #f1f5f9;
         border: 2px solid #94a3b8;
         color: #334155;
+    }
+
+    .machine-idle-badge .machine-status-icon-circle {
+        color: #475569;
     }
 
     .machine-spin {
@@ -1234,6 +1722,7 @@ st.markdown(
 if 'initialized' not in st.session_state:
     saved_state = load_state()
     gh_products = load_products_from_github() # ★起動時にGitHubからマスターを取得！
+    gh_cost_saving = load_cost_saving_from_github()
 
     if saved_state:
         st.session_state.jobs = saved_state['jobs']
@@ -1246,6 +1735,17 @@ if 'initialized' not in st.session_state:
         st.session_state.pending_signboard_confirmation = (
             saved_state.get('pending_signboard_confirmation')
         )
+        local_cost_saving = normalize_cost_saving_data(
+            saved_state.get('cost_saving_data')
+        )
+        if gh_cost_saving is not None:
+            st.session_state.cost_saving_data = merge_cost_saving_data(
+                gh_cost_saving,
+                local_cost_saving,
+                prefer_local_settings=False,
+            )
+        else:
+            st.session_state.cost_saving_data = local_cost_saving
 
         power_state_version = int(
             saved_state.get('mfr_power_state_version', 0)
@@ -1274,6 +1774,11 @@ if 'initialized' not in st.session_state:
         st.session_state.pending_power_off_due = None
         st.session_state.pending_production_finish_confirmation = None
         st.session_state.pending_signboard_confirmation = None
+        st.session_state.cost_saving_data = (
+            normalize_cost_saving_data(gh_cost_saving)
+            if gh_cost_saving is not None
+            else get_default_cost_saving_data()
+        )
         st.session_state.mfr_power_is_on = False
         st.session_state.mfr_power_on_confirmed_at = None
         default_products = {
@@ -1298,6 +1803,22 @@ if 'initialized' not in st.session_state:
                 f"{machine_name}_{anchor.strftime('%Y%m%d%H%M%S')}"
             )
 
+        if 'production_started_at' not in saved_job:
+            inferred_start = None
+            try:
+                job_stamp = str(saved_job.get('job_id', '')).rsplit('_', 1)[-1]
+                inferred_start = datetime.strptime(job_stamp, '%Y%m%d%H%M%S')
+            except (TypeError, ValueError):
+                pass
+            if inferred_start is None:
+                inferred_start = saved_job.get('last_update')
+            if not isinstance(inferred_start, datetime):
+                inferred_start = datetime.utcnow() + timedelta(hours=9)
+            saved_job['production_started_at'] = inferred_start
+
+        if 'measurement_records' not in saved_job:
+            saved_job['measurement_records'] = []
+
         # V1.5.4以前に開始した生産データにも加熱60分条件を補完する。
         # まだMFR測定を1回も完了していないLotだけを対象にする。
         if 'heat_ready_at' not in saved_job:
@@ -1316,6 +1837,10 @@ if 'initialized' not in st.session_state:
 
     st.session_state.initialized = True
     st.session_state.inspection_dialog_shown = False
+    # 起動時にローカルとクラウドの履歴を統合し、未同期分があれば反映する。
+    if GITHUB_TOKEN:
+        sync_cost_saving_to_github()
+        save_state()
 
 # コード更新中も既存ブラウザーセッションを安全に引き継ぐ
 if 'acknowledged_alerts' not in st.session_state:
@@ -1332,6 +1857,8 @@ if 'pending_production_finish_confirmation' not in st.session_state:
     st.session_state.pending_production_finish_confirmation = None
 if 'pending_signboard_confirmation' not in st.session_state:
     st.session_state.pending_signboard_confirmation = None
+if 'cost_saving_data' not in st.session_state:
+    st.session_state.cost_saving_data = get_default_cost_saving_data()
 
 # --- UI：サイドバー ---
 with st.sidebar:
@@ -1532,6 +2059,22 @@ def complete_mfr_measurement(machine, target_qty):
     if target_qty not in job['completed']:
         job['completed'].append(target_qty)
 
+        measurement_records = job.setdefault('measurement_records', [])
+        if not any(
+            record.get('target_qty') == target_qty
+            for record in measurement_records
+            if isinstance(record, dict)
+        ):
+            measurement_records.append({
+                'target_qty': target_qty,
+                'label': get_measurement_text(
+                    len(job.get('targets', [])),
+                    target_qty,
+                    job.get('targets', []),
+                ),
+                'measured_at': now_jst.isoformat(timespec='seconds'),
+            })
+
     # 実際の測定完了から10分後に電源OFF候補を作成。
     # 90分以内に次の測定がある場合は、次回更新時に自動取消する。
     st.session_state.pending_power_off_due = (
@@ -1580,6 +2123,14 @@ def undo_mfr_measurement(machine, target_qty):
     job['completed'] = [
         target for target in job['completed']
         if target != target_qty
+    ]
+    job['measurement_records'] = [
+        record
+        for record in job.get('measurement_records', [])
+        if not (
+            isinstance(record, dict)
+            and record.get('target_qty') == target_qty
+        )
     ]
 
     # 通知から測定完了にした場合も、未測定へ戻した時点で
@@ -1853,14 +2404,20 @@ active_alerts.sort(key=lambda item: item["due"])
 try:
     logo_base64 = get_image_base64(logo_path)
     logo_html = f"""
-    <div style="display: flex; align-items: flex-end; margin-bottom: 1rem;">
-        <img src="data:image/png;base64,{logo_base64}" height="100" style="margin-right: 15px; flex-shrink: 0;">
-        <span style="font-size: calc(1.4rem + 1.2vw); font-weight: 700; line-height: 1.0; color: #1f2937;">MFRスマート電源管理システム</span>
+    <div style="display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 1rem;">
+        <img src="data:image/png;base64,{logo_base64}" height="100" style="flex-shrink: 0;">
+        <div style="display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;">
+            <span style="font-size: calc(1.4rem + 1.2vw); font-weight: 700; line-height: 1.0; color: #1f2937;">MFRスマート電源管理システム</span>
+            <span style="font-size: calc(0.95rem + 0.35vw); font-weight: 800; line-height: 1.1; color: #475569; margin-bottom: 0.20rem;">Ver. {APP_VERSION}</span>
+        </div>
     </div>
     """
     st.markdown(logo_html, unsafe_allow_html=True)
 except:
-    st.title("MFRスマート電源管理システム")
+    st.markdown(
+        f"## MFRスマート電源管理システム　<span style='font-size:1.1rem;color:#475569;'>Ver. {APP_VERSION}</span>",
+        unsafe_allow_html=True,
+    )
 
 st.caption(f"現在時刻　{now.strftime('%Y/%m/%d %H:%M')}")
 
@@ -1902,6 +2459,8 @@ if active_alerts:
         key=f"ack_{primary_alert['id']}",
         type="primary",
     ):
+        cost_saving_changed = False
+
         if primary_alert["kind"] == "measurement":
             # 測定通知の確認＝実際のMFR測定完了として同時に記録する。
             complete_mfr_measurement(
@@ -1920,6 +2479,12 @@ if active_alerts:
             st.session_state.mfr_power_on_confirmed_at = (
                 power_on_confirmed_at
             )
+            cost_saving_changed = record_power_event(
+                "ON",
+                power_on_confirmed_at,
+                primary_alert["id"],
+                primary_alert.get("due"),
+            ) or cost_saving_changed
 
             # 「実機OFF」と確認していたLotは、実際にON操作を確認した
             # この時点から60分後を測定可能時刻として数え直す。
@@ -1939,9 +2504,18 @@ if active_alerts:
 
         elif primary_alert["kind"] == "power_off":
             # 作業者が実際にMFR電源をOFFにしたことを記録。
+            power_off_confirmed_at = (
+                datetime.utcnow() + timedelta(hours=9)
+            )
             st.session_state.mfr_power_is_on = False
             st.session_state.mfr_power_on_confirmed_at = None
             st.session_state.pending_power_off_due = None
+            cost_saving_changed = record_power_event(
+                "OFF",
+                power_off_confirmed_at,
+                primary_alert["id"],
+                primary_alert.get("due"),
+            ) or cost_saving_changed
 
             # OFF確認直後に、次回ON予定を表示札へ記入したか確認する。
             next_on_time = get_next_power_on_time(
@@ -1953,6 +2527,9 @@ if active_alerts:
             }
 
         save_state()
+        if cost_saving_changed:
+            sync_cost_saving_to_github()
+            save_state()
         stop_browser_alarm()
         st.rerun()
 
@@ -2151,7 +2728,7 @@ for order_no, (column, action_item) in enumerate(
                 f"""
                 <div class="next-action-card {measure_class}">
                     <div class="next-action-label">{"①" if order_no == 1 else "②"} 次のMFR測定</div>
-                    <div class="next-action-main">🎯 {measurement['machine']}・{meas_text}</div>
+                    <div class="next-action-main">🎯 {measurement['machine']}・{meas_text} 測定</div>
                     <div class="next-action-main">{measurement_time_text}</div>
                     <div class="next-action-sub">{sub_text}</div>
                 </div>
@@ -2296,6 +2873,8 @@ def finalize_production_start_with_actual_power(power_is_on):
         'cycle_time': pending['cycle_time'],
         'current_qty': current_qty,
         'last_update': start_timestamp,
+        'production_started_at': start_timestamp,
+        'measurement_records': [],
         'heat_ready_at': heat_ready_at,
         'waiting_for_mfr_power_on': waiting_for_mfr_power_on,
         'first_measure_due_at': first_measure_due_at,
@@ -2317,10 +2896,19 @@ def finish_production(machine, job_id):
         save_state()
         return
 
+    ended_at = datetime.utcnow() + timedelta(hours=9)
     job['status'] = 'Completed'
     job['current_qty'] = job['total_qty']
-    job['production_ended_at'] = datetime.utcnow() + timedelta(hours=9)
+    job['production_ended_at'] = ended_at
+    archive_production_job(
+        machine,
+        job,
+        ended_at,
+        'final_measurement_confirmed',
+    )
     st.session_state.pending_production_finish_confirmation = None
+    save_state()
+    sync_cost_saving_to_github()
     save_state()
     st.rerun()
 
@@ -2524,7 +3112,8 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
         if job is None:
             st.markdown(
                 '<div class="machine-status-badge machine-idle-badge">'
-                '● 停止中</div>',
+                '<span class="machine-status-icon-circle">●</span>'
+                '<span class="machine-status-label">停止中</span></div>',
                 unsafe_allow_html=True,
             )
             # ★その成型機用に登録された製品だけを抽出（※機種設定がない古いデータは全成型機に表示してエラー回避）
@@ -2584,20 +3173,22 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
             if job['status'] == 'Running':
                 st.markdown(
                     '<div class="machine-status-badge machine-running-badge">'
-                    '<span class="machine-spin">⟳</span>'
-                    '<span>成型中</span></div>',
+                    '<span class="machine-status-icon-circle"><span class="machine-spin">⟳</span></span>'
+                    '<span class="machine-status-label">成型中</span></div>',
                     unsafe_allow_html=True,
                 )
             elif job['status'] == 'Paused':
                 st.markdown(
                     '<div class="machine-status-badge machine-paused-badge">'
-                    '⏸ 一時停止</div>',
+                    '<span class="machine-status-icon-circle">⏸</span>'
+                    '<span class="machine-status-label">一時停止</span></div>',
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
                     '<div class="machine-status-badge machine-completed-badge">'
-                    '✅ 生産完了</div>',
+                    '<span class="machine-status-icon-circle">☑</span>'
+                    '<span class="machine-status-label">生産終了</span></div>',
                     unsafe_allow_html=True,
                 )
 
@@ -2626,12 +3217,23 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                             job['last_update'] = (datetime.utcnow() + timedelta(hours=9)); job['status'] = 'Running'; save_state(); st.rerun()
                 with col_ctrl2:
                     if st.button("⏹️ 生産終了", key=f"stop_main_{machine}"):
+                        ended_at = datetime.utcnow() + timedelta(hours=9)
+                        job['current_qty'] = est_current
+                        job['production_ended_at'] = ended_at
+                        archive_production_job(
+                            machine,
+                            job,
+                            ended_at,
+                            'manual_end',
+                        )
                         pending_finish = st.session_state.get(
                             'pending_production_finish_confirmation'
                         )
                         if pending_finish and pending_finish.get('machine') == machine:
                             st.session_state.pending_production_finish_confirmation = None
                         st.session_state.jobs[machine] = None
+                        save_state()
+                        sync_cost_saving_to_github()
                         save_state()
                         st.rerun()
 
@@ -2957,6 +3559,401 @@ if new_timeline_data:
     st.plotly_chart(fig, use_container_width=True)
 else:
     st.info("📊 グラフを表示するための稼働中のジョブはありません。")
+
+
+# --- UI：Cost Saving 実績 ---
+st.markdown("---")
+st.header("💰 Cost Saving")
+st.caption(
+    "生産終了実績とMFR電源の実操作履歴から、電力・労務費・設備消耗の"
+    "削減効果を日次／週次で自動集計します。"
+)
+
+cost_data = normalize_cost_saving_data(st.session_state.cost_saving_data)
+st.session_state.cost_saving_data = cost_data
+cost_settings = cost_data["settings"]
+now_cost = datetime.utcnow() + timedelta(hours=9)
+daily_effects, weekly_effects, power_off_intervals = build_cost_saving_summary(
+    cost_data,
+    now_cost,
+)
+
+current_week_key = _week_start(now_cost)
+current_week = weekly_effects.get(current_week_key, {
+    "saved_hours": 0.0,
+    "saved_kwh": 0.0,
+    "electricity_yen": 0.0,
+    "labor_yen": 0.0,
+    "maintenance_yen": 0.0,
+    "lots": 0,
+})
+
+cumulative = {
+    "saved_hours": 0.0,
+    "saved_kwh": 0.0,
+    "electricity_yen": 0.0,
+    "labor_yen": 0.0,
+    "maintenance_yen": 0.0,
+    "lots": 0,
+}
+for effect in weekly_effects.values():
+    for key in cumulative:
+        cumulative[key] += effect.get(key, 0) or 0
+
+st.markdown("#### 今週の効果（現在まで）")
+week_cols = st.columns(5)
+with week_cols[0]:
+    st.metric(
+        "合計効果",
+        f"¥{effect_total_yen(current_week):,.0f}",
+    )
+with week_cols[1]:
+    st.metric(
+        "電気代削減",
+        f"¥{current_week['electricity_yen']:,.0f}",
+        f"{current_week['saved_kwh']:.1f} kWh",
+    )
+with week_cols[2]:
+    st.metric(
+        "労務費削減",
+        f"¥{current_week['labor_yen']:,.0f}",
+        f"{int(current_week['lots'])} Lot",
+    )
+with week_cols[3]:
+    st.metric(
+        "設備消耗低減",
+        f"¥{current_week['maintenance_yen']:,.0f}",
+    )
+with week_cols[4]:
+    st.metric(
+        "削減通電時間",
+        f"{current_week['saved_hours']:.1f} h",
+    )
+
+with st.expander("📈 累計効果", expanded=False):
+    cumulative_cols = st.columns(5)
+    with cumulative_cols[0]:
+        st.metric("累計効果", f"¥{effect_total_yen(cumulative):,.0f}")
+    with cumulative_cols[1]:
+        st.metric(
+            "累計電気代削減",
+            f"¥{cumulative['electricity_yen']:,.0f}",
+            f"{cumulative['saved_kwh']:.1f} kWh",
+        )
+    with cumulative_cols[2]:
+        st.metric(
+            "累計労務費削減",
+            f"¥{cumulative['labor_yen']:,.0f}",
+            f"{int(cumulative['lots'])} Lot",
+        )
+    with cumulative_cols[3]:
+        st.metric(
+            "累計設備消耗低減",
+            f"¥{cumulative['maintenance_yen']:,.0f}",
+        )
+    with cumulative_cols[4]:
+        st.metric(
+            "累計削減通電時間",
+            f"{cumulative['saved_hours']:.1f} h",
+        )
+
+cost_tab_week, cost_tab_day, cost_tab_history, cost_tab_settings = st.tabs([
+    "📅 週次実績",
+    "📆 日次実績",
+    "🧾 生産・電源履歴",
+    "⚙️ 計算条件",
+])
+
+with cost_tab_week:
+    week_rows = []
+    if weekly_effects:
+        first_week = min(weekly_effects.keys())
+        cursor_week = first_week
+        while cursor_week <= current_week_key:
+            effect = weekly_effects.get(cursor_week, {})
+            week_end = cursor_week + timedelta(days=6)
+            week_rows.append({
+                "週": (
+                    f"{cursor_week.strftime('%Y/%m/%d')}～"
+                    f"{week_end.strftime('%m/%d')}"
+                ),
+                "Lot数": int(effect.get("lots", 0) or 0),
+                "削減通電時間(h)": round(
+                    float(effect.get("saved_hours", 0) or 0), 2
+                ),
+                "削減電力量(kWh)": round(
+                    float(effect.get("saved_kwh", 0) or 0), 2
+                ),
+                "電気代削減(円)": round(
+                    float(effect.get("electricity_yen", 0) or 0)
+                ),
+                "労務費削減(円)": round(
+                    float(effect.get("labor_yen", 0) or 0)
+                ),
+                "設備消耗低減(円)": round(
+                    float(effect.get("maintenance_yen", 0) or 0)
+                ),
+                "週間効果(円)": round(effect_total_yen(effect)),
+            })
+            cursor_week += timedelta(days=7)
+
+    if week_rows:
+        weekly_df = pd.DataFrame(week_rows).tail(52)
+        running_total = weekly_df["週間効果(円)"].cumsum()
+        # 表示範囲以前の実績がある場合も累計値がつながるよう補正。
+        all_week_total = sum(
+            round(effect_total_yen(effect))
+            for effect in weekly_effects.values()
+        )
+        visible_total = int(weekly_df["週間効果(円)"].sum())
+        carry = max(0, int(all_week_total) - visible_total)
+        weekly_df["累計効果(円)"] = running_total + carry
+
+        st.dataframe(
+            weekly_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        fig_cost = go.Figure()
+        fig_cost.add_trace(go.Bar(
+            x=weekly_df["週"],
+            y=weekly_df["週間効果(円)"],
+            name="週間効果",
+            marker_color="#2563eb",
+            text=weekly_df["週間効果(円)"].map(lambda value: f"¥{value:,.0f}"),
+            textposition="outside",
+        ))
+        fig_cost.update_layout(
+            title="週ごとのCost Saving効果",
+            xaxis_title="週",
+            yaxis_title="効果金額（円）",
+            height=420,
+            margin=dict(t=70, b=70, l=60, r=30),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_cost, use_container_width=True)
+
+        weekly_csv = weekly_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ 週次実績CSVをダウンロード",
+            data=weekly_csv,
+            file_name="MFR_Cost_Saving_週次実績.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("まだCost Saving実績はありません。")
+
+with cost_tab_day:
+    day_rows = []
+    for day_key in sorted(daily_effects.keys()):
+        effect = daily_effects[day_key]
+        day_rows.append({
+            "日付": day_key.strftime("%Y/%m/%d"),
+            "Lot数": int(effect.get("lots", 0) or 0),
+            "削減通電時間(h)": round(
+                float(effect.get("saved_hours", 0) or 0), 2
+            ),
+            "削減電力量(kWh)": round(
+                float(effect.get("saved_kwh", 0) or 0), 2
+            ),
+            "電気代削減(円)": round(
+                float(effect.get("electricity_yen", 0) or 0)
+            ),
+            "労務費削減(円)": round(
+                float(effect.get("labor_yen", 0) or 0)
+            ),
+            "設備消耗低減(円)": round(
+                float(effect.get("maintenance_yen", 0) or 0)
+            ),
+            "日次効果(円)": round(effect_total_yen(effect)),
+        })
+
+    if day_rows:
+        daily_df = pd.DataFrame(day_rows).tail(60)
+        st.dataframe(
+            daily_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("まだ日次実績はありません。")
+
+with cost_tab_history:
+    production_rows = []
+    sorted_production = sorted(
+        cost_data["production_history"],
+        key=lambda record: str(record.get("ended_at", "")),
+        reverse=True,
+    )
+    for record in sorted_production:
+        started_at = parse_history_datetime(record.get("started_at"))
+        ended_at = parse_history_datetime(record.get("ended_at"))
+        measurement_texts = []
+        for measurement in record.get("measurement_records", []):
+            if not isinstance(measurement, dict):
+                continue
+            measured_at = parse_history_datetime(measurement.get("measured_at"))
+            if measured_at is not None:
+                measurement_texts.append(
+                    f"{measurement.get('label', '')} {measured_at.strftime('%H:%M')}"
+                )
+
+        production_rows.append({
+            "終了日": ended_at.strftime("%Y/%m/%d") if ended_at else "",
+            "成型機": record.get("machine", ""),
+            "製品": record.get("product_name", ""),
+            "生産数": record.get("final_qty", 0),
+            "開始": started_at.strftime("%m/%d %H:%M") if started_at else "",
+            "終了": ended_at.strftime("%m/%d %H:%M") if ended_at else "",
+            "MFR測定": " / ".join(measurement_texts),
+            "測定回数": (
+                f"{record.get('measurement_completed_count', 0)}/"
+                f"{record.get('measurement_count', 0)}"
+            ),
+            "労務費削減(円)": round(
+                float(record.get("labor_saving_yen", 0) or 0)
+            ),
+        })
+
+    st.markdown("##### 生産履歴")
+    if production_rows:
+        production_df = pd.DataFrame(production_rows)
+        st.dataframe(
+            production_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+        production_csv = production_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ 生産履歴CSVをダウンロード",
+            data=production_csv,
+            file_name="MFR_Cost_Saving_生産履歴.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("まだ生産終了履歴はありません。")
+
+    st.markdown("##### MFR電源実績")
+    power_rows = []
+    for event in sorted(
+        cost_data["power_events"],
+        key=lambda item: str(item.get("actual_at", "")),
+        reverse=True,
+    ):
+        actual_at = parse_history_datetime(event.get("actual_at"))
+        scheduled_at = parse_history_datetime(event.get("scheduled_at"))
+        power_rows.append({
+            "実績日時": actual_at.strftime("%Y/%m/%d %H:%M") if actual_at else "",
+            "操作": event.get("action", ""),
+            "予定日時": scheduled_at.strftime("%Y/%m/%d %H:%M") if scheduled_at else "",
+        })
+
+    if power_rows:
+        st.dataframe(
+            pd.DataFrame(power_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("まだMFR電源ON/OFF実績はありません。")
+
+with cost_tab_settings:
+    st.write(
+        "この条件はCost Saving実績の計算に使用し、クラウドへ保存します。"
+        "修繕費または周期を0にすると設備消耗低減額は0円として扱います。"
+    )
+
+    with st.form("cost_saving_settings_form"):
+        set_col1, set_col2, set_col3 = st.columns(3)
+        with set_col1:
+            cs_power_kw = st.number_input(
+                "MFR消費電力 (kW)",
+                min_value=0.0,
+                value=float(cost_settings.get("power_kw", 0.80)),
+                step=0.10,
+                format="%.2f",
+                key="cs_power_kw_input",
+            )
+            cs_electricity_price = st.number_input(
+                "電気代単価 (円/kWh)",
+                min_value=0.0,
+                value=float(cost_settings.get("electricity_price", 25.0)),
+                step=1.0,
+                format="%.2f",
+                key="cs_electricity_price_input",
+            )
+        with set_col2:
+            cs_labor_rate = st.number_input(
+                "1時間当たり労務費 (円/h)",
+                min_value=0.0,
+                value=float(cost_settings.get("labor_hourly_rate", 4600.0)),
+                step=100.0,
+                key="cs_labor_rate_input",
+            )
+            cs_manual_minutes = st.number_input(
+                "システムなし管理時間 (分/Lot)",
+                min_value=0.0,
+                value=float(cost_settings.get("manual_minutes_per_lot", 5.0)),
+                step=0.5,
+                format="%.1f",
+                key="cs_manual_minutes_input",
+            )
+        with set_col3:
+            cs_maintenance_cost = st.number_input(
+                "修繕・メンテナンス費用 (円)",
+                min_value=0.0,
+                value=float(cost_settings.get("maintenance_cost", 0.0)),
+                step=10000.0,
+                key="cs_maintenance_cost_input",
+            )
+            cs_maintenance_life = st.number_input(
+                "メンテナンス周期 (時間)",
+                min_value=0.0,
+                value=float(cost_settings.get("maintenance_life_hours", 0.0)),
+                step=1000.0,
+                key="cs_maintenance_life_input",
+            )
+
+        if st.form_submit_button(
+            "💾 計算条件を保存（クラウド同期）",
+            use_container_width=True,
+        ):
+            st.session_state.cost_saving_data["settings"] = {
+                "power_kw": float(cs_power_kw),
+                "electricity_price": float(cs_electricity_price),
+                "labor_hourly_rate": float(cs_labor_rate),
+                "manual_minutes_per_lot": float(cs_manual_minutes),
+                "maintenance_cost": float(cs_maintenance_cost),
+                "maintenance_life_hours": float(cs_maintenance_life),
+            }
+            save_state()
+            cloud_saved = sync_cost_saving_to_github()
+            save_state()
+            if GITHUB_TOKEN and cloud_saved:
+                st.success("Cost Saving計算条件をクラウドへ保存しました。")
+            elif GITHUB_TOKEN:
+                st.warning(
+                    "ローカルには保存しましたが、クラウド同期に失敗しました。"
+                )
+            else:
+                st.info("ローカルへ保存しました。")
+            st.rerun()
+
+    if power_off_intervals and power_off_intervals[-1].get("open"):
+        st.caption(
+            "※現在MFR電源がOFF中の場合、OFF確認時刻から現在までの時間を"
+            "今週の削減効果へ暫定加算しています。"
+        )
+
+    if GITHUB_TOKEN:
+        st.caption(
+            f"クラウド保存先：{COST_SAVING_FILE}"
+        )
+    else:
+        st.caption(
+            "GitHubトークンが設定されていないため、現在はローカル保存です。"
+        )
 
 # --- UI：🌱EcoNavi ---
 st.markdown("---")
