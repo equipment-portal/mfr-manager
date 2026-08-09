@@ -1,3 +1,4 @@
+# Version 1.6.19: ダイアログ催促音を高音3連パルスへ強化・Cost Saving全削除後のUI状態を自動リセット
 # Version 1.6.18: 確認ダイアログ催促音を高音域へ変更（成形室の騒音下で気づきやすい音色）
 # Version 1.6.17: 確認ダイアログ専用の催促音を追加（応答まで繰返し・通常アラート音と分離）
 # Version 1.6.16: Cost Saving履歴の個別削除・週単位削除・全削除と削除後自動再集計を追加
@@ -781,7 +782,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.17"
+APP_VERSION = "1.6.19"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -873,7 +874,7 @@ ALERT_SOUND_FILE = os.path.join(
     "alert_crystal_rise.wav",
 )
 ALERT_SOUND_NAME = "クリスタルライズ"
-ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_6_18"
+ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_6_19"
 
 # 未確認中のWindows通知を再表示する間隔。
 # Excelを前面で使用していても気づきやすいよう、30秒ごとに再通知します。
@@ -1124,18 +1125,20 @@ def render_monitor_activation():
     compressor.connect(audioContext.destination);
 
     const master = audioContext.createGain();
-    master.gain.setValueAtTime(0.82, now);
+    master.gain.setValueAtTime(0.90, now);
     master.connect(compressor);
 
     // ダイアログ専用「確認催促音」。
-    // 成形室の騒音下でも気づきやすいよう、2kHz～3kHz帯の
-    // 高いダブルパルスを2セット鳴らす。
-    // 通常のクリスタルライズとは明確に区別する。
+    // 成形室の騒音に埋もれにくいよう、2.8kHz～4.8kHz帯の
+    // 高い3連パルスを2セット鳴らす。短く鋭い「ピピピッ」を
+    // 繰り返し、通常のクリスタルライズとは明確に区別する。
     const events = [
-      {start: 0.00, frequency: 2100.00, duration: 0.11, level: 0.72},
-      {start: 0.15, frequency: 3100.00, duration: 0.13, level: 0.84},
-      {start: 0.48, frequency: 2100.00, duration: 0.11, level: 0.72},
-      {start: 0.63, frequency: 3100.00, duration: 0.15, level: 0.88}
+      {start: 0.00, frequency: 2800.00, duration: 0.085, level: 0.82},
+      {start: 0.11, frequency: 3800.00, duration: 0.085, level: 0.92},
+      {start: 0.22, frequency: 4800.00, duration: 0.100, level: 1.00},
+      {start: 0.62, frequency: 2800.00, duration: 0.085, level: 0.82},
+      {start: 0.73, frequency: 3800.00, duration: 0.085, level: 0.92},
+      {start: 0.84, frequency: 4800.00, duration: 0.110, level: 1.00}
     ];
 
     for (const event of events) {
@@ -1144,13 +1147,13 @@ def render_monitor_activation():
       const eventStart = now + event.start;
       const eventEnd = eventStart + event.duration;
 
-      oscillator.type = "triangle";
+      oscillator.type = "square";
       oscillator.frequency.setValueAtTime(event.frequency, eventStart);
 
       gain.gain.setValueAtTime(0.0001, eventStart);
       gain.gain.exponentialRampToValueAtTime(
-        Math.max(0.0002, event.level * 0.18),
-        eventStart + 0.008
+        Math.max(0.0002, event.level * 0.20),
+        eventStart + 0.004
       );
       gain.gain.exponentialRampToValueAtTime(0.0001, eventEnd);
 
@@ -1236,9 +1239,9 @@ def render_monitor_activation():
       }
     };
 
-    // ダイアログ表示直後に鳴らし、その後は約3秒ごとに催促する。
+    // ダイアログ表示直後に鳴らし、その後は約2.6秒ごとに催促する。
     await playIfActive();
-    state.urgentTimer = w.setInterval(playIfActive, 3000);
+    state.urgentTimer = w.setInterval(playIfActive, 2600);
 
     // Edgeのタイマー停止・遅延時にも復旧する。
     state.urgentWatchdog = w.setInterval(() => {
@@ -1251,7 +1254,7 @@ def render_monitor_activation():
         enabled
         && activeDialogId === dialogId
         && state.urgentDialogId === dialogId
-        && elapsed >= 4200
+        && elapsed >= 3600
       ) {
         playIfActive();
       }
@@ -5244,6 +5247,17 @@ with cost_tab_history:
         "計算条件は削除されません。"
     )
 
+    delete_feedback = st.session_state.pop("cost_delete_feedback", None)
+    if delete_feedback:
+        feedback_kind = delete_feedback.get("kind", "success")
+        feedback_text = delete_feedback.get("text", "")
+        if feedback_kind == "warning":
+            st.warning(feedback_text)
+        elif feedback_kind == "info":
+            st.info(feedback_text)
+        else:
+            st.success(feedback_text)
+
     delete_mode = st.radio(
         "削除方法",
         ["個別削除", "週ごと全削除", "全削除"],
@@ -5350,24 +5364,50 @@ with cost_tab_history:
             "本当にすべて削除します",
             key="cost_delete_all_confirm_2",
         )
-        if st.button(
+
+        def handle_delete_all_cost_saving():
+            """全削除を実行し、削除後は確認UIを通常状態へ戻す。"""
+            if not (
+                st.session_state.get("cost_delete_all_confirm_1", False)
+                and st.session_state.get("cost_delete_all_confirm_2", False)
+            ):
+                return
+
+            if delete_all_cost_saving_history():
+                cloud_saved = save_cost_saving_history_change()
+                if GITHUB_TOKEN and not cloud_saved:
+                    st.session_state.cost_delete_feedback = {
+                        "kind": "warning",
+                        "text": (
+                            "ローカルではCost Saving履歴をすべて削除しましたが、"
+                            "クラウド同期に失敗しました。"
+                        ),
+                    }
+                else:
+                    st.session_state.cost_delete_feedback = {
+                        "kind": "success",
+                        "text": "✅ Cost Saving履歴をすべて削除しました。",
+                    }
+            else:
+                st.session_state.cost_delete_feedback = {
+                    "kind": "info",
+                    "text": "削除対象の履歴はありません。",
+                }
+
+            # 次の描画では通常の「個別削除」状態へ戻し、
+            # 全削除の赤い確認UI・チェック状態を残さない。
+            st.session_state.cost_delete_mode = "個別削除"
+            st.session_state.cost_delete_all_confirm_1 = False
+            st.session_state.cost_delete_all_confirm_2 = False
+
+        st.button(
             "🗑️ Cost Saving履歴をすべて削除",
             type="primary",
             disabled=not (confirm_all_1 and confirm_all_2),
             use_container_width=True,
             key="cost_delete_all_button",
-        ):
-            if delete_all_cost_saving_history():
-                cloud_saved = save_cost_saving_history_change()
-                if GITHUB_TOKEN and not cloud_saved:
-                    st.warning(
-                        "ローカルでは全削除しましたが、クラウド同期に失敗しました。"
-                    )
-                else:
-                    st.success("Cost Saving履歴をすべて削除しました。")
-                st.rerun()
-            else:
-                st.info("削除対象の履歴はありません。")
+            on_click=handle_delete_all_cost_saving,
+        )
 
 with cost_tab_settings:
     st.write(
