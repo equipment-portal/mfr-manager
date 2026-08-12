@@ -1,3 +1,4 @@
+# Version 1.6.28: 起動チャイム点滅ボタンのクリック処理を修正・親画面Storage例外で停止しない堅牢化
 # Version 1.6.27: 起動チャイムボタンを未確認時点滅・確認後は落ち着いた表示へ変更／同一Edgeセッション中は確認状態を維持
 # Version 1.6.26: Windows通知を廃止し、チャイム音のみで運用・起動ボタンのクリック診断表示を追加
 # Version 1.6.25: 通知時の最上部スクロールをStreamlit内部スクロール領域まで確実に戻す方式へ修正
@@ -790,7 +791,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.27"
+APP_VERSION = "1.6.28"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -882,7 +883,7 @@ ALERT_SOUND_FILE = os.path.join(
     "alert_crystal_rise.wav",
 )
 ALERT_SOUND_NAME = "クリスタルライズ"
-ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_6_19"
+ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_6_28"
 
 # 生産スタート時をMFR加熱開始時刻とし、初回測定は60分後以降にする。
 MFR_WARMUP_MINUTES = 60
@@ -1551,61 +1552,55 @@ def render_monitor_activation():
         font-weight: 900;
         border-radius: 8px;
         cursor: pointer;
-        transition: background-color 0.20s ease, color 0.20s ease,
-                    border-color 0.20s ease, box-shadow 0.20s ease;
+        position: relative;
+        z-index: 2;
+        pointer-events: auto;
+        touch-action: manipulation;
       }}
-
-      /* 起動確認前：青⇔黄で点滅し、クリックを強く促す。 */
       #mfr-enable.needs-activation {{
         border: 3px solid #1e3a8a;
         animation: mfr-activation-blink 1.15s ease-in-out infinite;
       }}
-
       @keyframes mfr-activation-blink {{
         0%, 100% {{
-          background: #1d4ed8;
+          background-color: #1d4ed8;
           color: #ffffff;
           border-color: #1e3a8a;
-          box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18),
-                      0 0 14px rgba(37, 99, 235, 0.55);
+          box-shadow: 0 0 14px rgba(37,99,235,0.55);
         }}
         50% {{
-          background: #facc15;
+          background-color: #facc15;
           color: #111827;
           border-color: #a16207;
-          box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.28),
-                      0 0 22px rgba(250, 204, 21, 0.78);
+          box-shadow: 0 0 22px rgba(250,204,21,0.78);
         }}
       }}
-
       #mfr-enable.activating {{
-        animation: none;
-        background: #1e40af;
-        color: #ffffff;
-        border: 2px solid #1e3a8a;
-        box-shadow: none;
+        animation: none !important;
+        background-color: #1e40af !important;
+        color: #ffffff !important;
+        border: 2px solid #1e3a8a !important;
+        box-shadow: none !important;
       }}
-
       #mfr-enable.activated {{
-        animation: none;
-        background: #64748b;
-        color: #ffffff;
-        border: 2px solid #475569;
-        box-shadow: none;
+        animation: none !important;
+        background-color: #64748b !important;
+        color: #ffffff !important;
+        border: 2px solid #475569 !important;
+        box-shadow: none !important;
       }}
-
       #mfr-enable.audio-error {{
-        animation: none;
-        background: #b91c1c;
-        color: #ffffff;
-        border: 2px solid #7f1d1d;
-        box-shadow: none;
+        animation: none !important;
+        background-color: #b91c1c !important;
+        color: #ffffff !important;
+        border: 2px solid #7f1d1d !important;
+        box-shadow: none !important;
       }}
     </style>
 
     <div style="font-family:Meiryo,sans-serif;border:1px solid #93c5fd;
                 border-radius:9px;padding:7px;background:#eff6ff;">
-      <button id="mfr-enable" class="needs-activation">
+      <button id="mfr-enable" class="needs-activation" type="button">
         起動時に必ず押してください。チャイム音テスト
       </button>
 
@@ -1640,33 +1635,27 @@ def render_monitor_activation():
           "activated",
           "audio-error"
         );
-
-        if (stateName === "activated") {{
-          button.classList.add("activated");
-          button.textContent = "✓ チャイム音 有効";
-        }} else if (stateName === "activating") {{
+        if (stateName === "activating") {{
           button.classList.add("activating");
           button.textContent = "チャイム音を確認中...";
+        }} else if (stateName === "activated") {{
+          button.classList.add("activated");
+          button.textContent = "✓ チャイム音 有効";
         }} else if (stateName === "error") {{
           button.classList.add("audio-error");
           button.textContent = "⚠ チャイム音を確認してください";
         }} else {{
           button.classList.add("needs-activation");
-          button.textContent =
-            "起動時に必ず押してください。チャイム音テスト";
+          button.textContent = "起動時に必ず押してください。チャイム音テスト";
         }}
       }}
 
-      function restoreActivationUi() {{
-        const activatedThisSession =
-          parentWindow.sessionStorage.getItem(
-            "mfr_monitor_activated_this_session"
-          ) === "1";
-
-        if (activatedThisSession) {{
-          setButtonState("activated");
-        }} else {{
-          setButtonState("needs-activation");
+      function safeStorageSet(storage, key, value) {{
+        try {{
+          storage.setItem(key, value);
+          return true;
+        }} catch (error) {{
+          return false;
         }}
       }}
 
@@ -1697,51 +1686,58 @@ def render_monitor_activation():
         parentWindow.document.head.appendChild(script);
       }}
 
-      button.addEventListener("click", async () => {{
+      button.addEventListener("click", async (event) => {{
+        event.preventDefault();
+        event.stopPropagation();
+
+        // クリックを受け付けた瞬間に点滅を停止する。
+        // 親画面側でエラーが起きても、クリック自体が入ったことを確認できる。
+        hideStatus();
+        setButtonState("activating");
+        button.disabled = true;
+
         try {{
-          hideStatus();
           installParentEngine();
 
-          // クリックを受け付けた時点で点滅を停止する。
-          setButtonState("activating");
+          if (
+            !parentWindow.__mfrCrystalEngine
+            || typeof parentWindow.__mfrCrystalEngine.activate !== "function"
+          ) {{
+            throw new Error("通知音エンジンを準備できませんでした。");
+          }}
 
-          // Windows通知は使用しない。ブラウザーの通知権限にも依存しない。
-          await parentWindow
-            .__mfrCrystalEngine
-            .activate();
+          // Windows通知は使用しない。チャイム音だけを有効化する。
+          await parentWindow.__mfrCrystalEngine.activate();
 
-          // 音が正常に再生できた場合だけ、このEdgeセッションで確認済みにする。
-          parentWindow.localStorage.setItem(
-            "mfr_monitor_enabled",
-            "1"
-          );
-          parentWindow.localStorage.setItem(
+          // Storage保存は補助処理。ここが失敗しても音声成功を無効にしない。
+          safeStorageSet(parentWindow.localStorage, "mfr_monitor_enabled", "1");
+          safeStorageSet(
+            parentWindow.localStorage,
             "mfr_alert_sound_version",
             soundVersion
-          );
-          parentWindow.sessionStorage.setItem(
-            "mfr_monitor_activated_this_session",
-            "1"
           );
 
           hideStatus();
           setButtonState("activated");
 
         }} catch (error) {{
-          parentWindow.sessionStorage.removeItem(
-            "mfr_monitor_activated_this_session"
-          );
           showError(
-            "⚠️ 通知音を再生できませんでした。\n"
-            + `エラー：${{error?.name || "UnknownError"}}\n`
+            "⚠️ チャイム音を再生できませんでした。\\n"
+            + `エラー：${{error?.name || "UnknownError"}}\\n`
             + `${{error?.message || String(error)}}`
           );
           setButtonState("error");
+        }} finally {{
+          button.disabled = false;
         }}
       }});
 
-      installParentEngine();
-      restoreActivationUi();
+      // 初期化時の親画面アクセスに失敗しても、ボタンのクリック処理は残す。
+      try {{
+        installParentEngine();
+      }} catch (error) {{
+        // クリック時に再試行する。
+      }}
     }})();
     </script>
     """
