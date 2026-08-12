@@ -1,3 +1,4 @@
+# Version 1.6.30: 生産終了ボタンは未測定が残っていても即時終了・レジューム保存復元を再確認／旧測定必須ダイアログを無効化
 # Version 1.6.29: 稼働中の成型機状態を専用GitHubブランチへ自動保存し、コード更新・再起動後も直前状態を復元
 # Version 1.6.28: 起動チャイム点滅ボタンのクリック処理を修正・親画面Storage例外で停止しない堅牢化
 # Version 1.6.27: 起動チャイムボタンを未確認時点滅・確認後は落ち着いた表示へ変更／同一Edgeセッション中は確認状態を維持
@@ -1084,7 +1085,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.29"
+APP_VERSION = "1.6.30"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -1151,10 +1152,9 @@ def save_state():
         'pending_power_off_context': st.session_state.get(
             'pending_power_off_context'
         ),
-        # 生産終了前に未記録MFR測定がある場合の確認待ち。
-        'pending_measurement_required_before_finish': st.session_state.get(
-            'pending_measurement_required_before_finish'
-        ),
+        # V1.6.30以降、手動の［生産終了］は未測定が残っていても即時終了する。
+        # 旧版の測定必須ダイアログ状態は保存せず、常に解除する。
+        'pending_measurement_required_before_finish': None,
         # 最終MFR測定後の「生産も終了ですか？」確認待ち。
         'pending_production_finish_confirmation': st.session_state.get(
             'pending_production_finish_confirmation'
@@ -2743,9 +2743,9 @@ if 'initialized' not in st.session_state:
         st.session_state.pending_power_off_context = saved_state.get(
             'pending_power_off_context'
         )
-        st.session_state.pending_measurement_required_before_finish = (
-            saved_state.get('pending_measurement_required_before_finish')
-        )
+        # V1.6.30で手動生産終了時の測定必須チェックを廃止したため、
+        # 旧版から残った確認待ちは復元しない。
+        st.session_state.pending_measurement_required_before_finish = None
         st.session_state.pending_production_finish_confirmation = (
             saved_state.get('pending_production_finish_confirmation')
         )
@@ -4415,12 +4415,6 @@ else:
 if st.session_state.get('pending_signboard_confirmation'):
     start_dialog_reminder("signboard_confirmation")
     show_signboard_confirmation_dialog()
-elif st.session_state.get('pending_measurement_required_before_finish'):
-    pending = st.session_state.get('pending_measurement_required_before_finish') or {}
-    start_dialog_reminder(
-        f"measurement_required_{pending.get('machine', '')}_{pending.get('job_id', '')}"
-    )
-    show_measurement_required_before_finish_dialog()
 elif st.session_state.get('pending_production_finish_confirmation'):
     pending = st.session_state.get('pending_production_finish_confirmation') or {}
     start_dialog_reminder(
@@ -4579,19 +4573,12 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                             job['last_update'] = (datetime.utcnow() + timedelta(hours=9)); job['status'] = 'Running'; save_state(); st.rerun()
                 with col_ctrl2:
                     if st.button("⏹️ 生産終了", key=f"stop_main_{machine}"):
-                        missing_labels = get_missing_measurement_labels(job)
-                        if missing_labels:
-                            # 途中終了の場合も、製品マスターで設定された回数分の
-                            # MFR測定記録を完了するまで生産終了させない。
-                            st.session_state.pending_measurement_required_before_finish = {
-                                'machine': machine,
-                                'job_id': job.get('job_id'),
-                            }
-                            save_state()
-                            st.rerun()
-
+                        # V1.6.30: 手動の［生産終了］は、未測定のMFRポイントが
+                        # 残っていても作業者の終了判断を優先し、即時停止する。
                         ended_at = datetime.utcnow() + timedelta(hours=9)
                         job['current_qty'] = est_current
+                        job['last_update'] = ended_at
+                        job['status'] = 'Completed'
                         job['production_ended_at'] = ended_at
                         archive_production_job(
                             machine,
@@ -4599,6 +4586,9 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                             ended_at,
                             'manual_end',
                         )
+
+                        # この成型機に残っている旧確認待ちを解除し、
+                        # 履歴保存後すぐに停止中（job=None）へ戻す。
                         pending_finish = st.session_state.get(
                             'pending_production_finish_confirmation'
                         )
