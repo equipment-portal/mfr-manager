@@ -1,3 +1,4 @@
+# Version 1.6.29: 稼働中の成型機状態を専用GitHubブランチへ自動保存し、コード更新・再起動後も直前状態を復元
 # Version 1.6.28: 起動チャイム点滅ボタンのクリック処理を修正・親画面Storage例外で停止しない堅牢化
 # Version 1.6.27: 起動チャイムボタンを未確認時点滅・確認後は落ち着いた表示へ変更／同一Edgeセッション中は確認状態を維持
 # Version 1.6.26: Windows通知を廃止し、チャイム音のみで運用・起動ボタンのクリック診断表示を追加
@@ -51,7 +52,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, date
 import pickle
 import os
 import base64
@@ -108,6 +109,298 @@ def save_products_to_github(products_dict):
         urllib.request.urlopen(req)
     except Exception as e:
         print("GitHubセーブエラー:", e)
+
+
+# --- 稼働状態のクラウド保存（コード更新・再起動対策） ---
+# main ブランチへ頻繁に状態を書き込むとアプリの再デプロイにつながる可能性があるため、
+# 稼働状態だけ専用ブランチへ保存する。
+RUNTIME_STATE_FILE = "mfr_runtime_state.json"
+RUNTIME_STATE_BRANCH = "mfr-runtime-state"
+RUNTIME_STATE_SCHEMA_VERSION = 1
+
+
+def _runtime_json_encode(value):
+    """datetime/dateを含む稼働状態をJSON保存可能な形式へ変換する。"""
+    if isinstance(value, datetime):
+        return {
+            "__mfr_runtime_type__": "datetime",
+            "value": value.isoformat(),
+        }
+    if isinstance(value, date):
+        return {
+            "__mfr_runtime_type__": "date",
+            "value": value.isoformat(),
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _runtime_json_encode(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_runtime_json_encode(item) for item in value]
+
+    # numpy等のスカラーが入った場合も通常のPython値へ変換する。
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def _runtime_json_decode(value):
+    """クラウド保存したdatetime/dateをPython値へ復元する。"""
+    if isinstance(value, dict):
+        runtime_type = value.get("__mfr_runtime_type__")
+        raw_value = value.get("value")
+        if runtime_type == "datetime" and raw_value:
+            try:
+                return datetime.fromisoformat(str(raw_value))
+            except (TypeError, ValueError):
+                return None
+        if runtime_type == "date" and raw_value:
+            try:
+                return date.fromisoformat(str(raw_value))
+            except (TypeError, ValueError):
+                return None
+        return {
+            key: _runtime_json_decode(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_runtime_json_decode(item) for item in value]
+    return value
+
+
+def ensure_runtime_state_branch():
+    """稼働状態専用ブランチがなければmainから1回だけ作成する。"""
+    if not GITHUB_TOKEN:
+        return False
+
+    api_base = f"https://api.github.com/repos/{GITHUB_REPO}"
+    branch_ref_url = (
+        f"{api_base}/git/ref/heads/{RUNTIME_STATE_BRANCH}"
+    )
+
+    try:
+        req = urllib.request.Request(branch_ref_url)
+        req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        return True
+    except Exception:
+        pass
+
+    try:
+        main_ref_url = f"{api_base}/git/ref/heads/main"
+        req_main = urllib.request.Request(main_ref_url)
+        req_main.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        with urllib.request.urlopen(req_main, timeout=10) as res:
+            main_sha = json.loads(res.read().decode("utf-8"))["object"]["sha"]
+
+        create_url = f"{api_base}/git/refs"
+        create_payload = {
+            "ref": f"refs/heads/{RUNTIME_STATE_BRANCH}",
+            "sha": main_sha,
+        }
+        req_create = urllib.request.Request(
+            create_url,
+            data=json.dumps(create_payload).encode("utf-8"),
+            method="POST",
+        )
+        req_create.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        req_create.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req_create, timeout=15):
+            pass
+        return True
+    except Exception:
+        # 同時作成などでPOSTが失敗しても、ブランチが存在すれば成功扱い。
+        try:
+            req = urllib.request.Request(branch_ref_url)
+            req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+            return True
+        except Exception as e:
+            print("稼働状態ブランチ準備エラー:", e)
+            return False
+
+
+def _build_runtime_state_payload(state_dict):
+    """クラウドへ保存する稼働中状態だけを抽出する。"""
+    runtime_keys = [
+        "jobs",
+        "last_inspection_date",
+        "acknowledged_alerts",
+        "pending_power_off_due",
+        "pending_power_off_context",
+        "pending_measurement_required_before_finish",
+        "pending_production_finish_confirmation",
+        "pending_signboard_confirmation",
+        "mfr_power_is_on",
+        "mfr_power_on_confirmed_at",
+        "mfr_power_state_version",
+    ]
+
+    saved_at = state_dict.get("state_saved_at")
+    if not isinstance(saved_at, datetime):
+        saved_at = datetime.utcnow() + timedelta(hours=9)
+
+    runtime_state = {
+        key: state_dict.get(key)
+        for key in runtime_keys
+    }
+
+    return {
+        "schema_version": RUNTIME_STATE_SCHEMA_VERSION,
+        "saved_at": saved_at.isoformat(),
+        "app_version": str(globals().get("APP_VERSION", "")),
+        "state": _runtime_json_encode(runtime_state),
+    }
+
+
+def load_runtime_state_from_github():
+    """専用ブランチから直近の稼働状態を取得する。"""
+    if not GITHUB_TOKEN or not ensure_runtime_state_branch():
+        return None
+
+    try:
+        api_url = (
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/"
+            f"{RUNTIME_STATE_FILE}?ref={RUNTIME_STATE_BRANCH}"
+        )
+        req = urllib.request.Request(api_url)
+        req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        with urllib.request.urlopen(req, timeout=10) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            payload = json.loads(content)
+
+        runtime_state = _runtime_json_decode(payload.get("state", {}))
+        if not isinstance(runtime_state, dict):
+            return None
+
+        saved_at_text = payload.get("saved_at")
+        try:
+            runtime_state["state_saved_at"] = datetime.fromisoformat(
+                str(saved_at_text)
+            )
+        except (TypeError, ValueError):
+            runtime_state["state_saved_at"] = None
+
+        runtime_state["runtime_state_source"] = "github"
+        return runtime_state
+    except Exception:
+        # 初回はファイル未作成なのでNoneで正常。
+        return None
+
+
+def save_runtime_state_to_github(state_dict):
+    """現在の稼働状態を専用ブランチへ保存する。"""
+    if not GITHUB_TOKEN or not ensure_runtime_state_branch():
+        return False
+
+    try:
+        api_url = (
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/"
+            f"{RUNTIME_STATE_FILE}"
+        )
+
+        sha = None
+        try:
+            req_check = urllib.request.Request(
+                f"{api_url}?ref={RUNTIME_STATE_BRANCH}"
+            )
+            req_check.add_header("Authorization", f"token {GITHUB_TOKEN}")
+            with urllib.request.urlopen(req_check, timeout=10) as res:
+                sha = json.loads(res.read().decode("utf-8")).get("sha")
+        except Exception:
+            pass
+
+        payload_data = _build_runtime_state_payload(state_dict)
+        encoded = base64.b64encode(
+            json.dumps(
+                payload_data,
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+        ).decode("utf-8")
+
+        payload = {
+            "message": "Update MFR Runtime State",
+            "content": encoded,
+            "branch": RUNTIME_STATE_BRANCH,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        req = urllib.request.Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="PUT",
+        )
+        req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+        return True
+    except Exception as e:
+        print("稼働状態GitHubセーブエラー:", e)
+        return False
+
+
+def _get_state_saved_at(state_dict, local_file_path=None):
+    """状態データの保存時刻を取得する。旧pickleはファイル更新時刻を補助使用。"""
+    if not isinstance(state_dict, dict):
+        return None
+
+    saved_at = state_dict.get("state_saved_at")
+    if isinstance(saved_at, datetime):
+        return saved_at
+    if isinstance(saved_at, str):
+        try:
+            return datetime.fromisoformat(saved_at)
+        except ValueError:
+            pass
+
+    if local_file_path and os.path.exists(local_file_path):
+        try:
+            return datetime.fromtimestamp(os.path.getmtime(local_file_path))
+        except OSError:
+            pass
+    return None
+
+
+def choose_newest_runtime_state(local_state, cloud_state, local_file_path=None):
+    """コード更新後はクラウドとローカルのうち新しい稼働状態を採用する。"""
+    if cloud_state is None:
+        return local_state
+    if local_state is None:
+        return cloud_state
+
+    cloud_time = _get_state_saved_at(cloud_state)
+    local_explicit_time = local_state.get("state_saved_at")
+
+    # V1.6.28以前のpickleには保存時刻フィールドがない。
+    # すでにクラウド状態が存在する場合は、古い同梱pickleよりクラウドを優先する。
+    if not isinstance(local_explicit_time, (datetime, str)):
+        selected = dict(cloud_state)
+    else:
+        local_time = _get_state_saved_at(local_state, local_file_path)
+        if cloud_time is None:
+            selected = dict(local_state)
+        elif local_time is None or cloud_time >= local_time:
+            selected = dict(cloud_state)
+        else:
+            selected = dict(local_state)
+
+    # 製品マスターとCost Savingは従来どおり別系統で同期するため、
+    # ローカルにしかない値があれば引き継ぐ。
+    for local_only_key in ("products", "cost_saving_data"):
+        if local_only_key not in selected and local_only_key in local_state:
+            selected[local_only_key] = local_state.get(local_only_key)
+
+    return selected
 
 
 # --- Cost Saving 実績・クラウド保存 ---
@@ -791,22 +1084,38 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.28"
+APP_VERSION = "1.6.29"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
 st_autorefresh(interval=AUTO_REFRESH_MS, key="data_refresh")
 
 # --- データの保存と読み込み ---
-STATE_FILE = "mfr_state.pkl"
+# 相対パスではなくapp.pyと同じ場所へ固定し、起動ディレクトリ差による読み違いを防ぐ。
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(SCRIPT_DIR, "mfr_state.pkl")
 
 def load_state():
+    """ローカルとクラウドの稼働状態を比較し、最も新しい状態を復元する。"""
+    local_state = None
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "rb") as f:
-                return pickle.load(f)
-        except Exception:
-            pass
+                loaded = pickle.load(f)
+            if isinstance(loaded, dict):
+                local_state = loaded
+        except Exception as e:
+            print("ローカル状態読み込みエラー:", e)
+
+    cloud_state = load_runtime_state_from_github()
+    selected_state = choose_newest_runtime_state(
+        local_state,
+        cloud_state,
+        STATE_FILE,
+    )
+
+    if isinstance(selected_state, dict):
+        return selected_state
     return None
 
 def infer_mfr_power_state_from_alert_history(alert_ids):
@@ -865,10 +1174,17 @@ def save_state():
             'mfr_power_on_confirmed_at'
         ),
         # V1.6.0以降の電源状態管理。
-        'mfr_power_state_version': 2
+        'mfr_power_state_version': 2,
+        # ローカル／クラウドのどちらが新しい状態か判定するための保存時刻。
+        'state_saved_at': datetime.utcnow() + timedelta(hours=9),
     }
     with open(STATE_FILE, "wb") as f:
         pickle.dump(state_to_save, f)
+
+    # V1.6.29以降は稼働状態も専用ブランチへ自動同期する。
+    # GitHub未設定・一時的な通信失敗でもローカル運用は継続する。
+    if GITHUB_TOKEN:
+        save_runtime_state_to_github(state_to_save)
 
 def get_image_base64(path):
     with open(path, "rb") as image_file:
@@ -877,7 +1193,7 @@ def get_image_base64(path):
 # --- Edge通知・チャイム音 ---
 # 通知音は必ずこのプログラムと同じフォルダーから読み込みます。
 # 旧版の alert_chime.wav を誤って読み込まないよう、固有名を使用します。
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# SCRIPT_DIR は状態ファイル設定時に定義済み。
 ALERT_SOUND_FILE = os.path.join(
     SCRIPT_DIR,
     "alert_crystal_rise.wav",
