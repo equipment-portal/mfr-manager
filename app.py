@@ -1,3 +1,5 @@
+# Version 1.6.27: 起動チャイムボタンを未確認時点滅・確認後は落ち着いた表示へ変更／同一Edgeセッション中は確認状態を維持
+# Version 1.6.26: Windows通知を廃止し、チャイム音のみで運用・起動ボタンのクリック診断表示を追加
 # Version 1.6.25: 通知時の最上部スクロールをStreamlit内部スクロール領域まで確実に戻す方式へ修正
 # Version 1.6.24: 測定記録未入力時の10分後フォロー通知・新規アラート時はページ最上部へ自動スクロール
 # Version 1.6.23: MFR測定記録後のOFF通知を即時化・次にやることへ即時OFFを反映・過去予定によるOFF取消を防止
@@ -788,7 +790,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.25"
+APP_VERSION = "1.6.27"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -881,10 +883,6 @@ ALERT_SOUND_FILE = os.path.join(
 )
 ALERT_SOUND_NAME = "クリスタルライズ"
 ALERT_SOUND_VERSION = "crystal_rise_parent_engine_1_6_19"
-
-# 未確認中のWindows通知を再表示する間隔。
-# Excelを前面で使用していても気づきやすいよう、30秒ごとに再通知します。
-WINDOWS_NOTIFICATION_REPEAT_MS = 30_000
 
 # 生産スタート時をMFR加熱開始時刻とし、初回測定は60分後以降にする。
 MFR_WARMUP_MINUTES = 60
@@ -1036,13 +1034,12 @@ def get_alert_sound_diagnostics():
 
 def render_monitor_activation():
     """
-    始業時にクリックして、通知音とWindows通知を有効にする。
+    始業時にクリックして、チャイム音の再生を有効にする。
 
     通知音エンジンはStreamlitのiframe内ではなく、
     親のEdge画面へscriptとして直接設置する。
     これにより10秒ごとの自動更新後も繰り返しタイマーを維持する。
     """
-    sound_name_js = json.dumps(ALERT_SOUND_NAME, ensure_ascii=False)
     sound_version_js = json.dumps(ALERT_SOUND_VERSION)
 
     parent_engine_code = r"""
@@ -1546,12 +1543,70 @@ def render_monitor_activation():
     parent_engine_code_js = json.dumps(parent_engine_code)
 
     html = f"""
+    <style>
+      #mfr-enable {{
+        width: 100%;
+        padding: 10px 12px;
+        font-size: 16px;
+        font-weight: 900;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: background-color 0.20s ease, color 0.20s ease,
+                    border-color 0.20s ease, box-shadow 0.20s ease;
+      }}
+
+      /* 起動確認前：青⇔黄で点滅し、クリックを強く促す。 */
+      #mfr-enable.needs-activation {{
+        border: 3px solid #1e3a8a;
+        animation: mfr-activation-blink 1.15s ease-in-out infinite;
+      }}
+
+      @keyframes mfr-activation-blink {{
+        0%, 100% {{
+          background: #1d4ed8;
+          color: #ffffff;
+          border-color: #1e3a8a;
+          box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18),
+                      0 0 14px rgba(37, 99, 235, 0.55);
+        }}
+        50% {{
+          background: #facc15;
+          color: #111827;
+          border-color: #a16207;
+          box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.28),
+                      0 0 22px rgba(250, 204, 21, 0.78);
+        }}
+      }}
+
+      #mfr-enable.activating {{
+        animation: none;
+        background: #1e40af;
+        color: #ffffff;
+        border: 2px solid #1e3a8a;
+        box-shadow: none;
+      }}
+
+      #mfr-enable.activated {{
+        animation: none;
+        background: #64748b;
+        color: #ffffff;
+        border: 2px solid #475569;
+        box-shadow: none;
+      }}
+
+      #mfr-enable.audio-error {{
+        animation: none;
+        background: #b91c1c;
+        color: #ffffff;
+        border: 2px solid #7f1d1d;
+        box-shadow: none;
+      }}
+    </style>
+
     <div style="font-family:Meiryo,sans-serif;border:1px solid #93c5fd;
                 border-radius:9px;padding:7px;background:#eff6ff;">
-      <button id="mfr-enable" style="width:100%;padding:9px;font-size:16px;
-              font-weight:bold;color:white;background:#1d4ed8;border:0;
-              border-radius:8px;cursor:pointer;">
-        起動時に必ず押してください。監視開始、チャイム音・Windows通知テスト
+      <button id="mfr-enable" class="needs-activation">
+        起動時に必ず押してください。チャイム音テスト
       </button>
 
       <div id="mfr-status" style="display:none;margin-top:8px;
@@ -1564,7 +1619,6 @@ def render_monitor_activation():
       const parentWindow = window.parent;
       const button = document.getElementById("mfr-enable");
       const status = document.getElementById("mfr-status");
-      const soundName = {sound_name_js};
       const soundVersion = {sound_version_js};
       const engineCode = {parent_engine_code_js};
       const engineScriptId = "mfr-crystal-parent-engine";
@@ -1577,6 +1631,43 @@ def render_monitor_activation():
       function hideStatus() {{
         status.textContent = "";
         status.style.display = "none";
+      }}
+
+      function setButtonState(stateName) {{
+        button.classList.remove(
+          "needs-activation",
+          "activating",
+          "activated",
+          "audio-error"
+        );
+
+        if (stateName === "activated") {{
+          button.classList.add("activated");
+          button.textContent = "✓ チャイム音 有効";
+        }} else if (stateName === "activating") {{
+          button.classList.add("activating");
+          button.textContent = "チャイム音を確認中...";
+        }} else if (stateName === "error") {{
+          button.classList.add("audio-error");
+          button.textContent = "⚠ チャイム音を確認してください";
+        }} else {{
+          button.classList.add("needs-activation");
+          button.textContent =
+            "起動時に必ず押してください。チャイム音テスト";
+        }}
+      }}
+
+      function restoreActivationUi() {{
+        const activatedThisSession =
+          parentWindow.sessionStorage.getItem(
+            "mfr_monitor_activated_this_session"
+          ) === "1";
+
+        if (activatedThisSession) {{
+          setButtonState("activated");
+        }} else {{
+          setButtonState("needs-activation");
+        }}
       }}
 
       function installParentEngine() {{
@@ -1611,6 +1702,15 @@ def render_monitor_activation():
           hideStatus();
           installParentEngine();
 
+          // クリックを受け付けた時点で点滅を停止する。
+          setButtonState("activating");
+
+          // Windows通知は使用しない。ブラウザーの通知権限にも依存しない。
+          await parentWindow
+            .__mfrCrystalEngine
+            .activate();
+
+          // 音が正常に再生できた場合だけ、このEdgeセッションで確認済みにする。
           parentWindow.localStorage.setItem(
             "mfr_monitor_enabled",
             "1"
@@ -1619,57 +1719,29 @@ def render_monitor_activation():
             "mfr_alert_sound_version",
             soundVersion
           );
-
-          let permission = "unsupported";
-          if ("Notification" in parentWindow) {{
-            permission =
-              parentWindow.Notification.permission;
-
-            if (permission === "default") {{
-              permission =
-                await parentWindow.Notification
-                  .requestPermission();
-            }}
-          }}
-
-          await parentWindow
-            .__mfrCrystalEngine
-            .activate();
-
-          if (permission === "granted") {{
-            const notification =
-              new parentWindow.Notification(
-                "MFR通知テスト",
-                {{
-                  body:
-                    `通知音「${{soundName}}」と`
-                    + "Windows通知の準備が完了しました。",
-                  tag: "mfr-notification-test",
-                  requireInteraction: true
-                }}
-              );
-
-            notification.onclick = () => {{
-              parentWindow.focus();
-              notification.close();
-            }};
-          }}
+          parentWindow.sessionStorage.setItem(
+            "mfr_monitor_activated_this_session",
+            "1"
+          );
 
           hideStatus();
-          button.textContent = "✓ チャイム音・Windows通知テスト";
-          button.style.background = "#1e40af";
+          setButtonState("activated");
 
         }} catch (error) {{
+          parentWindow.sessionStorage.removeItem(
+            "mfr_monitor_activated_this_session"
+          );
           showError(
-            "⚠️ 通知音を再生できませんでした。\\n"
-            + `エラー：${{error?.name || "UnknownError"}}\\n`
+            "⚠️ 通知音を再生できませんでした。\n"
+            + `エラー：${{error?.name || "UnknownError"}}\n`
             + `${{error?.message || String(error)}}`
           );
-          button.style.background = "#b91c1c";
+          setButtonState("error");
         }}
       }});
 
       installParentEngine();
+      restoreActivationUi();
     }})();
     </script>
     """
@@ -1680,20 +1752,16 @@ def render_monitor_activation():
 
 def start_browser_alarm(alert_id, title, body):
     """
-    親のEdge画面に設置した通知音エンジンへ、
+    親のブラウザー画面に設置した通知音エンジンへ、
     確認されるまでの繰り返し再生を依頼する。
+
+    V1.6.26以降はWindows通知を使用せず、チャイム音だけで通知する。
     """
     alert_id_json = json.dumps(alert_id, ensure_ascii=False)
-    title_json = json.dumps(title, ensure_ascii=False)
-    body_json = json.dumps(body, ensure_ascii=False)
-    repeat_ms = int(WINDOWS_NOTIFICATION_REPEAT_MS)
 
     launcher_code = f"""
 (() => {{
   const alertId = {alert_id_json};
-  const title = {title_json};
-  const body = {body_json};
-  const repeatMs = {repeat_ms};
 
   localStorage.setItem(
     "mfr_active_alert_id",
@@ -1740,47 +1808,6 @@ def start_browser_alarm(alert_id, title, body):
   }};
 
   startWhenReady();
-
-  const notifyTimeKey =
-    "mfr_notify_time_" + alertId;
-  const lastNotifyTime = Number(
-    localStorage.getItem(notifyTimeKey) || "0"
-  );
-  const currentTime = Date.now();
-
-  if (
-    currentTime - lastNotifyTime >= repeatMs
-    && "Notification" in window
-    && Notification.permission === "granted"
-  ) {{
-    if (window.__mfrNotification) {{
-      try {{
-        window.__mfrNotification.close();
-      }} catch (error) {{}}
-    }}
-
-    const notification =
-      new Notification(title, {{
-        body:
-          body
-          + "\\n未確認のため再通知しています。",
-        tag: "mfr-" + alertId,
-        requireInteraction: true,
-        renotify: true,
-        timestamp: currentTime
-      }});
-
-    notification.onclick = () => {{
-      window.focus();
-      notification.close();
-    }};
-
-    window.__mfrNotification = notification;
-    localStorage.setItem(
-      notifyTimeKey,
-      String(currentTime)
-    );
-  }}
 }})();
 """
     launcher_code_js = json.dumps(launcher_code)
@@ -1803,7 +1830,6 @@ def start_browser_alarm(alert_id, title, body):
     components.html(html, height=0, width=0)
 
 
-
 def stop_browser_alarm():
     stop_code = r"""
 (() => {
@@ -1822,12 +1848,6 @@ def stop_browser_alarm():
     }
   }
 
-  if (window.__mfrNotification) {
-    try {
-      window.__mfrNotification.close();
-    } catch (error) {}
-    window.__mfrNotification = null;
-  }
 })();
 """
     stop_code_js = json.dumps(stop_code)
@@ -3002,7 +3022,7 @@ for pt in valid_upcoming:
             if elapsed_from_due >= timedelta(minutes=10):
                 # 測定予定から10分経っても記録されていない場合は、
                 # 「測定記録忘れ」を明確にした新しいフォロー通知へ切り替える。
-                # IDを別にすることで、通知音・Windows通知・自動スクロールも
+                # IDを別にすることで、通知音・自動スクロールも
                 # 10分後に改めて発生させる。
                 reminder_id = (
                     f"MEAS_REMINDER_{job_id}_{pt['target_qty']}"
