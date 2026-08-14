@@ -1,3 +1,4 @@
+# Version 1.6.40: 製品マスター保存後は新規登録・既存編集どちらも入力欄と既存製品選択を空欄へ自動リセット
 # Version 1.6.39: 製品マスターを常時新規登録用空欄表示にし、既存製品選択を保存ボタン直上へ移動・保存ボタンを統一
 # Version 1.6.37: 製品マスターの新規登録ボタンと既存製品編集プルダウンを分離し、操作モードを明確化
 # Version 1.6.36: 製品名プルダウンを英字・数字の自然順へ統一（製品マスター／生産開始／削除）
@@ -1111,7 +1112,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.39"
+APP_VERSION = "1.6.40"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -3255,12 +3256,10 @@ with st.sidebar:
                     f"✓ 「{clean_name} ({clean_machine})」をクラウドに{action_text}しました！"
                 )
 
-                if edit_mode:
-                    # 編集保存後は同じ製品を表示して、保存内容を確認できるようにする。
-                    st.session_state.product_master_reload_edit_name = clean_name
-                else:
-                    # 新規登録後は次の登録に備えて、必ず空欄へ戻す。
-                    st.session_state.product_master_reset_after_save = True
+                # 新規登録・既存製品の編集どちらでも、保存成功後は
+                # 次の登録作業へすぐ移れるよう入力欄と既存製品選択を空欄へ戻す。
+                st.session_state.product_master_reset_after_save = True
+                st.session_state.product_master_reload_edit_name = None
                 st.rerun()
 
         # 4. 削除ツール
