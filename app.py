@@ -1,3 +1,4 @@
+# Version 1.6.38: 製品マスター新規登録時は成型機・生産数・サイクルを空欄にし、MFR測定3回をデフォルト化
 # Version 1.6.37: 製品マスターの新規登録ボタンと既存製品編集プルダウンを分離し、操作モードを明確化
 # Version 1.6.36: 製品名プルダウンを英字・数字の自然順へ統一（製品マスター／生産開始／削除）
 # Version 1.6.35: 管理用の一時停止履歴時刻補正を追加・補正時はローカルとGitHubレジューム状態へ同時保存
@@ -1110,7 +1111,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.37"
+APP_VERSION = "1.6.38"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -3057,10 +3058,32 @@ with st.sidebar:
             st.session_state.product_master_mode = 'new'
             st.session_state.product_master_edit_target = None
 
+        def reset_new_product_form_values():
+            """新規登録フォームを完全な空欄状態へ戻す。測定回数だけ3回を既定値にする。"""
+            st.session_state.product_new_name = ""
+            st.session_state.product_new_machine = ""
+            st.session_state.product_new_qty = ""
+            st.session_state.product_new_cycle = ""
+            st.session_state.product_new_measurements = 3
+
+        # 初回表示時の新規登録フォーム初期値。
+        # 成型機・生産数・サイクルは意図的に空欄、測定回数だけ3回を既定値とする。
+        new_form_defaults = {
+            'product_new_name': "",
+            'product_new_machine': "",
+            'product_new_qty': "",
+            'product_new_cycle': "",
+            'product_new_measurements': 3,
+        }
+        for _key, _default in new_form_defaults.items():
+            if _key not in st.session_state:
+                st.session_state[_key] = _default
+
         def start_new_product_registration():
             st.session_state.product_master_mode = 'new'
             st.session_state.product_master_edit_target = None
             st.session_state.product_master_edit_select = edit_placeholder
+            reset_new_product_form_values()
 
         def select_existing_product_for_edit():
             selected = st.session_state.get(
@@ -3073,6 +3096,7 @@ with st.sidebar:
             else:
                 st.session_state.product_master_mode = 'new'
                 st.session_state.product_master_edit_target = None
+                reset_new_product_form_values()
 
         st.button(
             "✨ 新規登録",
@@ -3094,17 +3118,45 @@ with st.sidebar:
             and selected_prod in st.session_state.products
         )
 
-        # 選択モードに応じてフォームの初期値を切り替える。
         if not edit_mode:
             selected_prod = None
-            def_name = ""
-            def_machine_idx = 0
-            def_qty = 100
-            def_cycle = 30.0
-            def_meas_idx = 0
             st.caption("✨ 新しい製品を登録します")
+
+            with st.form("product_form_new"):
+                p_name = st.text_input(
+                    "製品名",
+                    key="product_new_name",
+                )
+                p_machine = st.selectbox(
+                    "対象の成型機",
+                    ["", "100t", "450t", "550t"],
+                    key="product_new_machine",
+                    format_func=lambda x: "" if x == "" else x,
+                )
+                # 新規登録時は、既定値を勝手に登録しないよう数値欄も空欄から開始する。
+                p_qty = st.text_input(
+                    "生産数",
+                    key="product_new_qty",
+                )
+                p_cycle = st.text_input(
+                    "サイクルタイム(秒)",
+                    key="product_new_cycle",
+                )
+                p_meas = st.radio(
+                    "MFR測定回数",
+                    options=[2, 3],
+                    index=1,
+                    key="product_new_measurements",
+                    format_func=lambda x: (
+                        "2回 (初め・終わり)"
+                        if x == 2
+                        else "3回 (初め・中・終わり)"
+                    ),
+                )
+                submit_btn = st.form_submit_button(
+                    "💾 新規登録（クラウド同期）"
+                )
         else:
-            def_name = selected_prod
             p_info = st.session_state.products[selected_prod]
 
             # エラー防止：古いデータに machine がない場合は 100t にする。
@@ -3114,87 +3166,122 @@ with st.sidebar:
                 if m_val in ["100t", "450t", "550t"]
                 else 0
             )
-            def_qty = p_info.get('qty', 100)
+            def_qty = int(p_info.get('qty', 100))
             def_cycle = float(p_info.get('cycle', 30.0))
             def_meas_idx = 0 if p_info.get('measurements', 2) == 2 else 1
             st.caption(f"📝 「{selected_prod}」を修正します")
 
-        # モード／編集対象が変わったときにフォームの値も確実に切り替える。
-        form_key = (
-            f"product_form_edit_{selected_prod}"
-            if edit_mode
-            else "product_form_new"
-        )
+            with st.form(f"product_form_edit_{selected_prod}"):
+                p_name = st.text_input("製品名", value=selected_prod)
+                p_machine = st.selectbox(
+                    "対象の成型機",
+                    ["100t", "450t", "550t"],
+                    index=def_machine_idx,
+                )
+                p_qty = st.number_input(
+                    "生産数",
+                    min_value=1,
+                    value=def_qty,
+                )
+                p_cycle = st.number_input(
+                    "サイクルタイム(秒)",
+                    min_value=0.1,
+                    value=def_cycle,
+                    step=0.1,
+                )
+                p_meas = st.radio(
+                    "MFR測定回数",
+                    options=[2, 3],
+                    index=def_meas_idx,
+                    format_func=lambda x: (
+                        "2回 (初め・終わり)"
+                        if x == 2
+                        else "3回 (初め・中・終わり)"
+                    ),
+                )
+                submit_btn = st.form_submit_button(
+                    "💾 修正・更新（クラウド同期）"
+                )
 
-        with st.form(form_key):
-            p_name = st.text_input("製品名", value=def_name)
-            p_machine = st.selectbox(
-                "対象の成型機",
-                ["100t", "450t", "550t"],
-                index=def_machine_idx,
-            )
-            p_qty = st.number_input("生産数", min_value=1, value=def_qty)
-            p_cycle = st.number_input(
-                "サイクルタイム(秒)",
-                min_value=0.1,
-                value=def_cycle,
-                step=0.1,
-            )
-            p_meas = st.radio(
-                "MFR測定回数",
-                options=[2, 3],
-                index=def_meas_idx,
-                format_func=lambda x: (
-                    "2回 (初め・終わり)"
-                    if x == 2
-                    else "3回 (初め・中・終わり)"
-                ),
-            )
+        if submit_btn:
+            clean_name = str(p_name).strip()
+            clean_machine = str(p_machine).strip()
+            validation_error = None
 
-            submit_label = (
-                "💾 修正・更新（クラウド同期）"
-                if edit_mode
-                else "💾 新規登録（クラウド同期）"
-            )
-            submit_btn = st.form_submit_button(submit_label)
+            if not clean_name:
+                validation_error = "製品名を入力してください。"
+            elif not clean_machine:
+                validation_error = "対象の成型機を選択してください。"
 
-            if submit_btn:
-                clean_name = p_name.strip()
-                if not clean_name:
-                    st.warning("製品名を入力してください。")
-                elif not edit_mode and clean_name in st.session_state.products:
-                    st.warning(
-                        f"「{clean_name}」はすでに登録されています。"
-                        "上の『修正する既存の製品名を選択』から編集してください。"
-                    )
-                elif (
-                    edit_mode
-                    and clean_name != selected_prod
-                    and clean_name in st.session_state.products
-                ):
-                    st.warning(
-                        f"「{clean_name}」はすでに登録されています。"
-                        "別の製品名を指定してください。"
-                    )
-                else:
-                    # 編集時に製品名を変更した場合は旧名を削除してリネームする。
-                    if edit_mode and clean_name != selected_prod:
-                        del st.session_state.products[selected_prod]
+            clean_qty = None
+            if validation_error is None:
+                try:
+                    if edit_mode:
+                        clean_qty = int(p_qty)
+                    else:
+                        qty_text = str(p_qty).strip()
+                        if not qty_text:
+                            raise ValueError
+                        clean_qty = int(qty_text)
+                    if clean_qty <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    validation_error = "生産数を1以上の整数で入力してください。"
 
-                    st.session_state.products[clean_name] = {
-                        'machine': p_machine,
-                        'qty': p_qty,
-                        'cycle': p_cycle,
-                        'measurements': p_meas,
-                    }
-                    save_state()
-                    save_products_to_github(st.session_state.products)
+            clean_cycle = None
+            if validation_error is None:
+                try:
+                    if edit_mode:
+                        clean_cycle = float(p_cycle)
+                    else:
+                        cycle_text = str(p_cycle).strip()
+                        if not cycle_text:
+                            raise ValueError
+                        clean_cycle = float(cycle_text)
+                    if clean_cycle <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    validation_error = "サイクルタイムを0より大きい数値で入力してください。"
 
-                    action_text = "更新" if edit_mode else "新規登録"
-                    st.info(
-                        f"✓ 「{clean_name} ({p_machine})」をクラウドに{action_text}しました！"
-                    )
-                    st.rerun()
+            if validation_error:
+                st.warning(validation_error)
+            elif not edit_mode and clean_name in st.session_state.products:
+                st.warning(
+                    f"「{clean_name}」はすでに登録されています。"
+                    "上の『修正する既存の製品名を選択』から編集してください。"
+                )
+            elif (
+                edit_mode
+                and clean_name != selected_prod
+                and clean_name in st.session_state.products
+            ):
+                st.warning(
+                    f"「{clean_name}」はすでに登録されています。"
+                    "別の製品名を指定してください。"
+                )
+            else:
+                # 編集時に製品名を変更した場合は旧名を削除してリネームする。
+                if edit_mode and clean_name != selected_prod:
+                    del st.session_state.products[selected_prod]
+
+                st.session_state.products[clean_name] = {
+                    'machine': clean_machine,
+                    'qty': clean_qty,
+                    'cycle': clean_cycle,
+                    'measurements': int(p_meas),
+                }
+                save_state()
+                save_products_to_github(st.session_state.products)
+
+                action_text = "更新" if edit_mode else "新規登録"
+                st.info(
+                    f"✓ 「{clean_name} ({clean_machine})」をクラウドに{action_text}しました！"
+                )
+
+                # 新規登録完了後も次の登録に備えて空欄へ戻す。
+                if not edit_mode:
+                    reset_new_product_form_values()
+                st.rerun()
 
         # 4. 削除ツール
         st.markdown("---")
