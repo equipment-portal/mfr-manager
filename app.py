@@ -1,3 +1,6 @@
+# Version 1.6.33: 一時停止中の生産終了予定を「現在時刻＋残り成型時間」で随時更新
+# Version 1.6.32: MFR測定記録から10分後をOFF実績・状況表示の固定時刻にし、OFF確認未応答でも通知音と確認ダイアログを継続
+# Version 1.6.31: MFR電源OFFを「実機OFF＋表示札記入」確認ダイアログへ統合／固定7時日常点検を廃止し電源ONごとの点検・記録確認へ変更
 # Version 1.6.30: 生産終了ボタンは未測定が残っていても即時終了・レジューム保存復元を再確認／旧測定必須ダイアログを無効化
 # Version 1.6.29: 稼働中の成型機状態を専用GitHubブランチへ自動保存し、コード更新・再起動後も直前状態を復元
 # Version 1.6.28: 起動チャイム点滅ボタンのクリック処理を修正・親画面Storage例外で停止しない堅牢化
@@ -1085,7 +1088,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.30"
+APP_VERSION = "1.6.33"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -1142,13 +1145,14 @@ def infer_mfr_power_state_from_alert_history(alert_ids):
 def save_state():
     state_to_save = {
         'jobs': st.session_state.jobs,
-        'last_inspection_date': st.session_state.last_inspection_date,
+        # V1.6.31以降、固定時刻の日常点検状態は使用しない。互換性のためキーのみ残す。
+        'last_inspection_date': None,
         'products': st.session_state.products,
         # 作業者が［確認しました］を押した通知だけを保存
         'acknowledged_alerts': st.session_state.acknowledged_alerts,
-        # 実際に測定・点検が完了した10分後の電源OFF通知
+        # 実際のMFR測定完了後、次予定が遠い場合の電源OFF確認待ち
         'pending_power_off_due': st.session_state.pending_power_off_due,
-        # OFF通知で「どの測定／点検が完了したか」を説明するための文脈。
+        # OFF確認ダイアログで「どの測定が完了したか」を説明するための文脈。
         'pending_power_off_context': st.session_state.get(
             'pending_power_off_context'
         ),
@@ -1159,7 +1163,7 @@ def save_state():
         'pending_production_finish_confirmation': st.session_state.get(
             'pending_production_finish_confirmation'
         ),
-        # 電源OFF確認後の「次回ON予定を表示札へ記入」確認待ち。
+        # 『実機OFF＋表示札記入』を一括確認するダイアログ待ち。
         'pending_signboard_confirmation': st.session_state.get(
             'pending_signboard_confirmation'
         ),
@@ -2737,7 +2741,8 @@ if 'initialized' not in st.session_state:
 
     if saved_state:
         st.session_state.jobs = saved_state['jobs']
-        st.session_state.last_inspection_date = saved_state['last_inspection_date']
+        # V1.6.31以降は固定7時の日常点検状態を使用しない。
+        st.session_state.last_inspection_date = None
         st.session_state.acknowledged_alerts = saved_state.get('acknowledged_alerts', [])
         st.session_state.pending_power_off_due = saved_state.get('pending_power_off_due')
         st.session_state.pending_power_off_context = saved_state.get(
@@ -2749,9 +2754,17 @@ if 'initialized' not in st.session_state:
         st.session_state.pending_production_finish_confirmation = (
             saved_state.get('pending_production_finish_confirmation')
         )
-        st.session_state.pending_signboard_confirmation = (
-            saved_state.get('pending_signboard_confirmation')
-        )
+        # V1.6.30以前の pending_signboard_confirmation は
+        # 「電源OFF確認後の表示札だけの確認」だったため復元しない。
+        # V1.6.31形式（mode=off_and_signboard）のみ復元する。
+        restored_off_dialog = saved_state.get('pending_signboard_confirmation')
+        if (
+            isinstance(restored_off_dialog, dict)
+            and restored_off_dialog.get('mode') == 'off_and_signboard'
+        ):
+            st.session_state.pending_signboard_confirmation = restored_off_dialog
+        else:
+            st.session_state.pending_signboard_confirmation = None
         local_cost_saving = normalize_cost_saving_data(
             saved_state.get('cost_saving_data')
         )
@@ -2855,7 +2868,6 @@ if 'initialized' not in st.session_state:
                 saved_job['heat_ready_at'] = None
 
     st.session_state.initialized = True
-    st.session_state.inspection_dialog_shown = False
     # 起動時にローカルとクラウドの履歴を統合し、未同期分があれば反映する。
     if GITHUB_TOKEN:
         sync_cost_saving_to_github()
@@ -2959,10 +2971,6 @@ with st.sidebar:
         st.session_state.pending_signboard_confirmation = None
         save_state(); st.rerun()
         
-    if st.button("🔄 今日の点検状態を未実施に戻す"):
-        st.session_state.last_inspection_date = None; st.session_state.inspection_dialog_shown = False
-        save_state(); st.rerun()
-
     if st.button("🔕 通知の確認履歴をリセット（テスト用）"):
         # 履歴だけをリセットし、現在の実機電源状態記録は変更しない。
         st.session_state.acknowledged_alerts = []
@@ -3017,46 +3025,46 @@ def calculate_planned_measurement_time(job, target):
 
 
 def calculate_upcoming_measurements():
-    upcoming = []
-    max_date = today_date 
-    
-    for machine, job in st.session_state.jobs.items():
-        if job is None or job['status'] == 'Completed': continue
-        for target in job['targets']:
-            if target not in job['completed']:
-                if job['status'] == 'Running':
-                    est_time = calculate_planned_measurement_time(
-                        job,
-                        target,
-                    )
-                elif job['status'] == 'Paused':
-                    est_time = None 
-                
-                upcoming.append({
-                    'machine': machine, 'target_qty': target, 'est_time': est_time,
-                    'status': job['status'], 'Targets': job['targets']
-                })
-                if est_time and est_time.date() > max_date:
-                    max_date = est_time.date()
-    
-    # 日常点検の予定を自動追加
-    for i in range((max_date - today_date).days + 1):
-        d = today_date + timedelta(days=i)
-        if d == today_date and st.session_state.last_inspection_date == today_date:
-            continue
-        is_monday_d = (d.weekday() == 0)
-        insp_time = datetime(d.year, d.month, d.day, 8 if is_monday_d else 7, 0, 0)
-        est_time_insp = insp_time
-        upcoming.append({
-            'machine': '日常点検(A勤)', 'target_qty': '日常点検',
-            'est_time': est_time_insp, 'status': 'Planned', 'Targets': ['日常点検']
-        })
+    """3台の成型機について、未完了のMFR測定予定だけを返す。
 
-    valid_upcoming = [x for x in upcoming if x['est_time'] is not None]
-    valid_upcoming.sort(key=lambda x: x['est_time'])
+    V1.6.31以降、固定時刻の日常点検予定はここへ追加しない。
+    日常点検はMFR電源をONにするたび、その場で実施・記録する運用とする。
+    """
+    upcoming = []
+
+    for machine, job in st.session_state.jobs.items():
+        if job is None or job['status'] == 'Completed':
+            continue
+
+        for target in job['targets']:
+            if target in job['completed']:
+                continue
+
+            if job['status'] == 'Running':
+                est_time = calculate_planned_measurement_time(job, target)
+            elif job['status'] == 'Paused':
+                est_time = None
+            else:
+                est_time = None
+
+            upcoming.append({
+                'machine': machine,
+                'target_qty': target,
+                'est_time': est_time,
+                'status': job['status'],
+                'Targets': job['targets'],
+            })
+
+    valid_upcoming = [
+        item for item in upcoming
+        if item['est_time'] is not None
+    ]
+    valid_upcoming.sort(key=lambda item: item['est_time'])
     return valid_upcoming, upcoming
 
+
 valid_upcoming, all_upcoming = calculate_upcoming_measurements()
+
 
 
 def complete_mfr_measurement(machine, target_qty):
@@ -3102,9 +3110,11 @@ def complete_mfr_measurement(machine, target_qty):
 
     # このボタンは「MFR測定が完了した後」に押すため、
     # 押下時点＝実際の測定完了時刻として扱う。
-    # 次の測定・点検まで十分な空き時間がある場合は、
-    # 追加で10分待たず、その場で電源OFFアラートを出す。
-    # 90分以内に次の測定・点検がある場合は、次回更新時に自動取消する。
+    # 次のMFR測定まで十分な空き時間がある場合は、
+    # OFF確認ダイアログ自体はその場で表示する。
+    # ただし、状況表示とCost SavingのOFF実績は、作業者の応答時刻に関係なく
+    # 「測定記録から10分後」を正式なOFF時刻として固定する。
+    # 90分以内に次のMFR測定がある場合は、次回更新時に自動取消する。
     st.session_state.pending_power_off_due = now_jst
     measurement_label = get_measurement_text(
         len(job.get('targets', [])),
@@ -3116,6 +3126,9 @@ def complete_mfr_measurement(machine, target_qty):
         'machine': machine,
         'label': measurement_label,
         'completed_at': now_jst,
+        'effective_off_at': now_jst + timedelta(minutes=10),
+        'confirmation_acknowledged': False,
+        'off_recorded': False,
     }
 
     all_measurements_completed = all(
@@ -3184,10 +3197,16 @@ def undo_mfr_measurement(machine, target_qty):
         )
     ]
 
-    # 誤完了によって作られた10分後のOFF予約を解除する。
+    # 誤完了によって作られたOFF確認待ちを解除する。
     # 未測定へ戻したポイントを含め、次回rerunで電源ON区間を再計算する。
     st.session_state.pending_power_off_due = None
     st.session_state.pending_power_off_context = None
+    pending_off_dialog = st.session_state.get('pending_signboard_confirmation')
+    if (
+        isinstance(pending_off_dialog, dict)
+        and pending_off_dialog.get('mode') == 'off_and_signboard'
+    ):
+        st.session_state.pending_signboard_confirmation = None
 
     pending_finish = st.session_state.get(
         'pending_production_finish_confirmation'
@@ -3253,7 +3272,7 @@ def get_next_power_action(reference_time):
     """
     power_is_on = bool(st.session_state.get('mfr_power_is_on', False))
 
-    # 測定・点検完了後にOFF待ちがある場合は、
+    # MFR測定完了後にOFF確認待ちがある場合は、
     # タイムライン上の未来のON予定よりも実際の次操作を優先する。
     # 測定記録ボタン押下時点でOFF可能なら「今すぐOFF」を表示する。
     pending_off = st.session_state.get('pending_power_off_due')
@@ -3296,28 +3315,8 @@ def get_next_power_action(reference_time):
 # 「表示しただけ」では消さず、作業者が［確認しました］を押すまで active_alerts に残します。
 active_alerts = []
 
-is_monday = (today_date.weekday() == 0)
-inspection_start_hour = 8 if is_monday else 7
-inspection_start_time = datetime.combine(today_date, dt_time(inspection_start_hour, 0, 0))
-inspection_end_time = datetime.combine(today_date, dt_time(10, 0, 0))
-
-# 1. 日常点検（10時を過ぎても自動完了にはしない）
-if st.session_state.last_inspection_date != today_date and now >= inspection_start_time:
-    inspection_alert_id = f"INSP_{today_date.strftime('%Y%m%d')}"
-    if inspection_alert_id not in st.session_state.acknowledged_alerts:
-        active_alerts.append({
-            "id": inspection_alert_id,
-            "due": inspection_start_time,
-            "title": "📋 日常点検アラート",
-            "message": f"本日の日常点検が未完了です。予定時刻は {inspection_start_time.strftime('%H:%M')} です。",
-            "kind": "inspection",
-        })
-
-# 2. MFR測定（予定時刻になったら、確認されるまでアラートを継続）
+# 1. MFR測定（予定時刻になったら、確認されるまでアラートを継続）
 for pt in valid_upcoming:
-    if pt['machine'] == '日常点検(A勤)':
-        continue
-
     m_time = pt['est_time']
     if m_time <= now:
         job = st.session_state.jobs.get(pt['machine'])
@@ -3362,20 +3361,20 @@ for pt in valid_upcoming:
                     )
                     if remaining_minutes > 90:
                         followup_action = (
-                            f"次の測定・点検まで"
+                            f"次の測定まで"
                             f"{format_remaining_time(remaining_minutes)}あるため、"
-                            "測定記録後にMFR測定器の電源をOFFにしてください。"
+                            "測定記録後に表示される確認ダイアログで、電源OFFと表示札記入を確認してください。"
                         )
                     else:
                         followup_action = (
-                            f"次の測定・点検まで"
+                            f"次の測定まで"
                             f"{format_remaining_time(remaining_minutes)}です。"
                             "測定記録を確実に行ってください。"
                         )
                 else:
                     followup_action = (
-                        "次の測定・点検予定がないため、測定記録後に"
-                        "MFR測定器の電源をOFFにしてください。"
+                        "次のMFR測定予定がないため、測定記録後に"
+                        "電源OFFと表示札記入を確認してください。"
                     )
 
                 active_alerts.append({
@@ -3406,8 +3405,8 @@ for pt in valid_upcoming:
                     "target_qty": pt['target_qty'],
                 })
 
-# 3. 電源ON・OFF
-# on_blocks の終了時刻には、最終測定後10分の冷却時間を含めています。
+# 2. MFR電源ON
+# on_blocks の終了時刻には、最終MFR測定の所要時間10分を含めています。
 for b_start, b_off in on_blocks:
     target_tasks = [
         x['machine'] for x in valid_upcoming
@@ -3435,22 +3434,16 @@ for b_start, b_off in on_blocks:
             first_measure_time = first_measure['est_time']
             target_machine = first_measure['machine']
 
-            if target_machine == '日常点検(A勤)':
-                on_context = (
-                    f"INSP_"
-                    f"{first_measure_time.strftime('%Y%m%d_%H%M')}"
-                )
-            else:
-                first_job = st.session_state.jobs.get(target_machine)
-                first_job_id = (
-                    first_job.get('job_id', target_machine)
-                    if first_job is not None
-                    else target_machine
-                )
-                on_context = (
-                    f"{first_job_id}_"
-                    f"{first_measure['target_qty']}"
-                )
+            first_job = st.session_state.jobs.get(target_machine)
+            first_job_id = (
+                first_job.get('job_id', target_machine)
+                if first_job is not None
+                else target_machine
+            )
+            on_context = (
+                f"{first_job_id}_"
+                f"{first_measure['target_qty']}"
+            )
         else:
             first_measure_time = b_start + timedelta(minutes=60)
             on_context = b_start.strftime('%Y%m%d_%H%M%S')
@@ -3466,26 +3459,42 @@ for b_start, b_off in on_blocks:
             active_alerts.append({
                 "id": alert_id_on,
                 "due": b_start,
-                "title": "🔥 MFR電源ONアラート",
+                "title": "🔥 MFR電源ON・日常点検",
                 "message": (
                     f"MFR測定器の電源をONにしてください。"
                     f" 対象：{target_machine}／"
                     f"最初の予定：{first_measure_time.strftime('%m/%d %H:%M')}"
+                    "<div style='margin-top:12px;padding:12px 14px;"
+                    "border:3px solid #b45309;background:#fff7d6;"
+                    "border-radius:8px;font-size:1.2rem;font-weight:900;"
+                    "color:#7c2d12;'>"
+                    "⚠️ 電源ON時には必ず日常点検を行い、<br>"
+                    "日常点検記録シートにその都度記入してください。"
+                    "</div>"
                 ),
                 "kind": "power_on",
             })
 
-# 4. 実際の測定完了後、次予定が遠ければ即時電源OFF
+# 3. 実際の測定完了後、次予定が遠ければ「OFF＋表示札」確認ダイアログ
 pending_off_due = st.session_state.pending_power_off_due
 if pending_off_due is not None:
-    # 未完了の測定・点検が「完了時刻より後、90分以内」に残る場合だけ、
-    # 電源を維持するためOFF予約を取り消す。
-    # 過去時刻の未完了予定が残っていてもOFF判断を邪魔させない。
     off_context = st.session_state.get('pending_power_off_context') or {}
     completion_time = off_context.get('completed_at')
     if not isinstance(completion_time, datetime):
         completion_time = pending_off_due
 
+    # V1.6.31以前の保存状態との互換性。
+    # OFFの正式実績時刻は、測定完了（記録）から10分後で固定する。
+    effective_off_at = off_context.get('effective_off_at')
+    if not isinstance(effective_off_at, datetime):
+        effective_off_at = completion_time + timedelta(minutes=10)
+        off_context['effective_off_at'] = effective_off_at
+        off_context.setdefault('confirmation_acknowledged', False)
+        off_context.setdefault('off_recorded', False)
+        st.session_state.pending_power_off_context = off_context
+
+    # 未完了のMFR測定が「完了時刻より後、90分以内」に残る場合だけ、
+    # 電源を維持するためOFF予定・確認待ちを取り消す。
     keep_power_on = any(
         item['est_time'] is not None
         and completion_time < item['est_time']
@@ -3496,61 +3505,91 @@ if pending_off_due is not None:
     if keep_power_on:
         st.session_state.pending_power_off_due = None
         st.session_state.pending_power_off_context = None
+        current_off_dialog = st.session_state.get('pending_signboard_confirmation')
+        if (
+            isinstance(current_off_dialog, dict)
+            and current_off_dialog.get('mode') == 'off_and_signboard'
+        ):
+            st.session_state.pending_signboard_confirmation = None
         save_state()
-    elif now >= pending_off_due:
-        off_context = st.session_state.get('pending_power_off_context') or {}
-        off_source_key = str(off_context.get('machine') or off_context.get('type') or 'MFR')
-        off_source_key = ''.join(ch for ch in off_source_key if ch.isalnum() or ch in ('-', '_'))
-        alert_id_off = (
-            f"OFF_ACTUAL_{pending_off_due.strftime('%Y%m%d_%H%M%S')}_{off_source_key}"
+    else:
+        off_source_key = str(
+            off_context.get('machine')
+            or off_context.get('type')
+            or 'MFR'
         )
-        if alert_id_off not in st.session_state.acknowledged_alerts:
-            context_type = off_context.get('type')
+        off_source_key = ''.join(
+            ch for ch in off_source_key
+            if ch.isalnum() or ch in ('-', '_')
+        )
+        off_dialog_id = (
+            f"OFF_CONFIRM_{pending_off_due.strftime('%Y%m%d_%H%M%S')}_"
+            f"{off_source_key}"
+        )
+        off_event_id = (
+            f"OFF_ACTUAL_{effective_off_at.strftime('%Y%m%d_%H%M%S')}_"
+            f"{off_source_key}"
+        )
 
-            if context_type == 'measurement':
-                source_text = (
-                    f"{off_context.get('machine', '対象')}の成型機の"
-                    f"「{off_context.get('label', 'MFR')}」の測定が完了しました。"
-                )
-            elif context_type == 'inspection':
-                source_text = "日常点検が完了しました。"
-            else:
-                source_text = "最後の測定・点検が完了しました。"
+        # OFF確認メッセージは測定記録直後から表示する。
+        # 10分後にシステム上OFFへ切り替わった後も、未応答なら残し続ける。
+        if (
+            now >= pending_off_due
+            and not bool(off_context.get('confirmation_acknowledged', False))
+        ):
+            current_off_dialog = st.session_state.get('pending_signboard_confirmation')
+            if not (
+                isinstance(current_off_dialog, dict)
+                and current_off_dialog.get('mode') == 'off_and_signboard'
+                and current_off_dialog.get('id') == off_dialog_id
+            ):
+                next_on_time = get_next_power_on_time(now)
+                st.session_state.pending_signboard_confirmation = {
+                    'mode': 'off_and_signboard',
+                    'id': off_dialog_id,
+                    'due': pending_off_due,
+                    'effective_off_at': effective_off_at,
+                    'next_on_time': next_on_time,
+                    'off_context': off_context,
+                }
+                save_state()
 
-            next_mfr_after_off = next(
-                (
-                    item for item in valid_upcoming
-                    if item['machine'] != '日常点検(A勤)'
-                    and item.get('est_time') is not None
-                    and item['est_time'] > now
-                ),
-                None,
+        # 作業者の「はい」の時刻には左右されず、測定記録から10分後になったら
+        # 状況表示をOFFへ変更し、Cost SavingのOFF実績もその10分後時刻で記録する。
+        if (
+            now >= effective_off_at
+            and not bool(off_context.get('off_recorded', False))
+        ):
+            st.session_state.mfr_power_is_on = False
+            st.session_state.mfr_power_on_confirmed_at = None
+
+            cost_saving_changed = record_power_event(
+                "OFF",
+                effective_off_at,
+                off_event_id,
+                effective_off_at,
             )
+            off_context['off_recorded'] = True
+            st.session_state.pending_power_off_context = off_context
+            save_state()
+            if cost_saving_changed:
+                sync_cost_saving_to_github()
+                save_state()
 
-            if next_mfr_after_off is not None:
-                remaining_minutes = max(
-                    1,
-                    int(math.ceil(
-                        (next_mfr_after_off['est_time'] - now).total_seconds()
-                        / 60
-                    )),
-                )
-                next_measure_text = (
-                    f"次の測定まで{format_remaining_time(remaining_minutes)}あるため、"
-                )
-            else:
-                next_measure_text = "次のMFR測定予定がないため、"
-
-            active_alerts.append({
-                "id": alert_id_off,
-                "due": pending_off_due,
-                "title": "💤 MFR電源OFFアラート",
-                "message": (
-                    f"{source_text} {next_measure_text}"
-                    "MFR測定器の電源をOFFにしてください。"
-                ),
-                "kind": "power_off",
-            })
+        # 「はい」も済み、10分後のOFF実績記録も済んだら待ち状態を完全終了する。
+        if (
+            bool(off_context.get('confirmation_acknowledged', False))
+            and bool(off_context.get('off_recorded', False))
+        ):
+            st.session_state.pending_power_off_due = None
+            st.session_state.pending_power_off_context = None
+            current_off_dialog = st.session_state.get('pending_signboard_confirmation')
+            if (
+                isinstance(current_off_dialog, dict)
+                and current_off_dialog.get('mode') == 'off_and_signboard'
+            ):
+                st.session_state.pending_signboard_confirmation = None
+            save_state()
 
 active_alerts.sort(key=lambda item: item["due"])
 
@@ -3613,6 +3652,8 @@ if active_alerts:
 
     if primary_alert["kind"] == "measurement":
         ack_button_text = "✅ 測定済みとして記録（通知音を停止）"
+    elif primary_alert["kind"] == "power_on":
+        ack_button_text = "✅ はい、電源ON・日常点検・記録を完了しました"
     else:
         ack_button_text = "✅ 確認しました（通知音を停止）"
 
@@ -3664,30 +3705,6 @@ if active_alerts:
                     waiting_job['waiting_for_mfr_power_on'] = False
                     waiting_job['first_measure_due_at'] = None
 
-        elif primary_alert["kind"] == "power_off":
-            # 作業者が実際にMFR電源をOFFにしたことを記録。
-            power_off_confirmed_at = (
-                datetime.utcnow() + timedelta(hours=9)
-            )
-            st.session_state.mfr_power_is_on = False
-            st.session_state.mfr_power_on_confirmed_at = None
-            st.session_state.pending_power_off_due = None
-            st.session_state.pending_power_off_context = None
-            cost_saving_changed = record_power_event(
-                "OFF",
-                power_off_confirmed_at,
-                primary_alert["id"],
-                primary_alert.get("due"),
-            ) or cost_saving_changed
-
-            # OFF確認直後に、次回ON予定を表示札へ記入したか確認する。
-            next_on_time = get_next_power_on_time(
-                datetime.utcnow() + timedelta(hours=9)
-            )
-            st.session_state.pending_signboard_confirmation = {
-                'next_on_time': next_on_time,
-                'off_confirmed_at': datetime.utcnow() + timedelta(hours=9),
-            }
 
         save_state()
         if cost_saving_changed:
@@ -3713,59 +3730,18 @@ else:
 st.caption("※シフト開始時に青いボタンを1回押し、Edgeは開いたままにしてください。")
 
 st.markdown('<div class="top-section-title">💡 MFR状態</div>', unsafe_allow_html=True)
-status_col, inspection_col = st.columns([1.25, 1.0])
+st.markdown("**MFR電源**")
 
-with status_col:
-    st.markdown("**MFR電源**")
-
-    if st.session_state.get('mfr_power_is_on', False):
-        st.markdown(
-            '<div class="status-card status-blue">⚡ MFR電源 ON</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            '<div class="status-card status-gray">○ MFR電源 OFF</div>',
-            unsafe_allow_html=True,
-        )
-
-
-with inspection_col:
-    st.markdown("**日常点検**")
-    is_monday = (today_date.weekday() == 0)
-    inspection_start_time = datetime.combine(
-        today_date,
-        dt_time(8 if is_monday else 7, 0, 0),
+if st.session_state.get('mfr_power_is_on', False):
+    st.markdown(
+        '<div class="status-card status-blue">⚡ MFR電源 ON</div>',
+        unsafe_allow_html=True,
     )
-
-    if st.session_state.last_inspection_date == today_date:
-        st.markdown(
-            '<div class="status-card status-blue">✅ 点検済み</div>',
-            unsafe_allow_html=True,
-        )
-    elif now >= inspection_start_time:
-        st.markdown(
-            f'<div class="status-card status-red">! 点検未完了 '
-            f'（{inspection_start_time.strftime("%H:%M")}予定）</div>',
-            unsafe_allow_html=True,
-        )
-        if st.button("✅ 日常点検 完了", key="inspection_complete_top"):
-            st.session_state.last_inspection_date = today_date
-            st.session_state.pending_power_off_due = (
-                now + timedelta(minutes=10)
-            )
-            st.session_state.pending_power_off_context = {
-                'type': 'inspection',
-                'completed_at': now,
-            }
-            save_state()
-            st.rerun()
-    else:
-        st.markdown(
-            f'<div class="status-card status-yellow">○ 点検未実施 '
-            f'（{inspection_start_time.strftime("%H:%M")}開始）</div>',
-            unsafe_allow_html=True,
-        )
+else:
+    st.markdown(
+        '<div class="status-card status-gray">○ MFR電源 OFF</div>',
+        unsafe_allow_html=True,
+    )
 
 # --- UI：次にやること（タイムラインと同じ予定を時刻順に表示） ---
 st.header("⏭️ 次にやること")
@@ -3774,8 +3750,7 @@ next_power_action, next_power_time = get_next_power_action(now)
 next_mfr = next(
     (
         item for item in valid_upcoming
-        if item['machine'] != '日常点検(A勤)'
-        and item['est_time'] is not None
+        if item['est_time'] is not None
     ),
     None,
 )
@@ -4260,15 +4235,52 @@ def render_production_finish_confirmation_dialog():
 
 
 def render_signboard_confirmation_dialog():
-    """MFR電源OFF確認後に、表示札への次回ON時刻記入を確認する。"""
+    """MFR電源OFFと表示札記入の確認。OFF実績時刻とは独立して応答を管理する。"""
     pending = st.session_state.get('pending_signboard_confirmation')
-    if not pending:
+    if not (
+        isinstance(pending, dict)
+        and pending.get('mode') == 'off_and_signboard'
+    ):
         return
 
     next_on_time = pending.get('next_on_time')
+    off_context = st.session_state.get('pending_power_off_context') or {}
+    if not off_context:
+        off_context = pending.get('off_context') or {}
     now_jst = datetime.utcnow() + timedelta(hours=9)
 
-    st.markdown("### MFR電源表示札を確認してください")
+    effective_off_at = off_context.get('effective_off_at')
+    if not isinstance(effective_off_at, datetime):
+        effective_off_at = pending.get('effective_off_at')
+    if not isinstance(effective_off_at, datetime):
+        completed_at = off_context.get('completed_at')
+        if isinstance(completed_at, datetime):
+            effective_off_at = completed_at + timedelta(minutes=10)
+
+    st.markdown("### MFR電源OFF・表示札を確認してください")
+
+    if off_context.get('type') == 'measurement':
+        st.caption(
+            f"{off_context.get('machine', '')} 成型機 ｜ "
+            f"{off_context.get('label', 'MFR')} 測定完了"
+        )
+
+    st.markdown(
+        "<div style='padding:14px 16px;border:3px solid #b45309;"
+        "background:#fff7d6;border-radius:8px;font-size:1.25rem;"
+        "font-weight:900;color:#7c2d12;margin:0.5rem 0 1rem;'>"
+        "① MFR測定器の電源をOFFにしてください。<br>"
+        "② 表示札に次の電源ON予定時刻を記入してください。"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    if isinstance(effective_off_at, datetime):
+        effective_text = effective_off_at.strftime('%H:%M')
+        st.info(
+            f"システム上のMFR電源OFF時刻・Cost Saving実績は "
+            f"{effective_text}（測定記録から10分後）として計算します。"
+        )
 
     if isinstance(next_on_time, datetime):
         next_on_text = format_next_action_time(next_on_time, now_jst)
@@ -4278,8 +4290,8 @@ def render_signboard_confirmation_dialog():
             f"次の電源ON　{next_on_text}</div>",
             unsafe_allow_html=True,
         )
-        st.write("次の電源ON予定時刻を表示札に記入しましたか？")
-        confirm_text = "✅ はい、記入しました"
+        st.write("表示札に、上記の次回電源ON予定時刻を記入してください。")
+        confirm_text = "✅ はい、電源OFF・表示札記入を完了しました"
     else:
         st.markdown(
             "<div style='font-size:1.7rem;font-weight:900;"
@@ -4287,17 +4299,35 @@ def render_signboard_confirmation_dialog():
             "次の電源ON予定はありません</div>",
             unsafe_allow_html=True,
         )
-        st.write("表示札をOFF状態にしましたか？")
-        confirm_text = "✅ はい、確認しました"
+        st.write("表示札をOFF状態にしてください。")
+        confirm_text = "✅ はい、電源OFF・表示札確認を完了しました"
 
     if st.button(
         confirm_text,
         type="primary",
         use_container_width=True,
-        key="confirm_signboard_written",
+        key="confirm_power_off_and_signboard",
     ):
+        # 応答は「作業者確認」としてのみ扱う。
+        # OFF実績・状況表示の切替時刻は、応答が早くても遅くても
+        # 測定記録から10分後の effective_off_at で固定する。
         stop_dialog_reminder()
+
+        off_dialog_id = pending.get('id') or (
+            f"OFF_CONFIRM_{now_jst.strftime('%Y%m%d_%H%M%S')}"
+        )
+        if off_dialog_id not in st.session_state.acknowledged_alerts:
+            st.session_state.acknowledged_alerts.append(off_dialog_id)
+
+        off_context['confirmation_acknowledged'] = True
+        st.session_state.pending_power_off_context = off_context
         st.session_state.pending_signboard_confirmation = None
+
+        # すでに10分後を経過してOFF実績が記録済みなら、待ち状態も終了する。
+        if bool(off_context.get('off_recorded', False)):
+            st.session_state.pending_power_off_due = None
+            st.session_state.pending_power_off_context = None
+
         save_state()
         st.rerun()
 
@@ -4349,15 +4379,15 @@ def render_mfr_power_confirmation_dialog():
         st.rerun()
 
 
-# 電源OFF後の表示札記入確認ダイアログ。
+# MFR電源OFF＋表示札記入の一括確認ダイアログ。
 if hasattr(st, "dialog"):
     show_signboard_confirmation_dialog = st.dialog(
-        "📝 表示札の確認",
+        "🔌 MFR電源OFF・表示札の確認",
         width="small",
     )(render_signboard_confirmation_dialog)
 elif hasattr(st, "experimental_dialog"):
     show_signboard_confirmation_dialog = st.experimental_dialog(
-        "📝 表示札の確認",
+        "🔌 MFR電源OFF・表示札の確認",
     )(render_signboard_confirmation_dialog)
 else:
     show_signboard_confirmation_dialog = render_signboard_confirmation_dialog
@@ -4413,7 +4443,7 @@ else:
 
 
 if st.session_state.get('pending_signboard_confirmation'):
-    start_dialog_reminder("signboard_confirmation")
+    start_dialog_reminder("power_off_and_signboard_confirmation")
     show_signboard_confirmation_dialog()
 elif st.session_state.get('pending_production_finish_confirmation'):
     pending = st.session_state.get('pending_production_finish_confirmation') or {}
@@ -4691,6 +4721,17 @@ for machine, job in st.session_state.jobs.items():
             'production_ended_at',
             datetime.utcnow() + timedelta(hours=9),
         )
+    elif job['status'] == 'Paused':
+        # V1.6.33: 一時停止中は生産数が進まないため、
+        # 「今この瞬間に再開した場合」の終了見込みを表示する。
+        # 停止している時間だけ終了予定も後ろへずれる。
+        remaining_qty = max(
+            0,
+            job['total_qty'] - job['current_qty'],
+        )
+        end_time = now + timedelta(
+            seconds=remaining_qty * job['cycle_time']
+        )
     else:
         end_time = job['last_update'] + timedelta(
             seconds=(job['total_qty'] - job['current_qty']) * job['cycle_time']
@@ -4737,14 +4778,6 @@ for machine, job in st.session_state.jobs.items():
         })
 
 today_start = datetime.combine(now.date(), dt_time.min)
-
-if st.session_state.last_inspection_date == today_date:
-    inspection_time = datetime(now.year, now.month, now.day, 8 if is_monday else 7, 0, 0)
-    measurement_points.append({'Task': 'MFR電源', 'Time': inspection_time, 'Target_Qty': '点検済', 'Targets': ['点検済'], 'Status': 'Completed'})
-
-for pt in valid_upcoming:
-    if pt['machine'] == '日常点検(A勤)':
-        measurement_points.append({'Task': 'MFR電源', 'Time': pt['est_time'], 'Target_Qty': '日常点検', 'Targets': ['日常点検'], 'Status': 'Planned'})
 
 for b_start, b_end in on_blocks:
     timeline_data.append({'Task': 'MFR電源', 'Start': b_start, 'End': b_end, 'Status': 'ON'})
@@ -4887,7 +4920,7 @@ if new_timeline_data:
             
             df_comp = df_pts_in_facet[df_pts_in_facet['Status'] == 'Completed']
             if not df_comp.empty:
-                trace_completed_text = ['点検済' if pt.get('Targets', []) and pt['Targets'][0] == '点検済' else get_measurement_text(len(pt.get('Targets', [])), pt['Target_Qty'], pt.get('Targets', [])) for pt in df_comp.to_dict('records')]
+                trace_completed_text = [get_measurement_text(len(pt.get('Targets', [])), pt['Target_Qty'], pt.get('Targets', [])) for pt in df_comp.to_dict('records')]
                 fig.add_trace(go.Scatter(
                     x=df_comp['TimeDummy'], y=df_comp['Task'], mode='markers+text',
                     marker=dict(color='#2563eb', size=18, symbol='circle', line=dict(width=3, color='black')),
@@ -4897,7 +4930,7 @@ if new_timeline_data:
 
             df_plan = df_pts_in_facet[df_pts_in_facet['Status'] == 'Planned']
             if not df_plan.empty:
-                trace_planned_text = ['日常点検' if pt.get('Targets', []) and pt['Targets'][0] == '日常点検' else get_measurement_text(len(pt.get('Targets', [])), pt['Target_Qty'], pt.get('Targets', [])) for pt in df_plan.to_dict('records')]
+                trace_planned_text = [get_measurement_text(len(pt.get('Targets', [])), pt['Target_Qty'], pt.get('Targets', [])) for pt in df_plan.to_dict('records')]
                 fig.add_trace(go.Scatter(
                     x=df_plan['TimeDummy'], y=df_plan['Task'], mode='markers+text',
                     marker=dict(color='#ffd43b', size=20, symbol='diamond', line=dict(width=3, color='black')),
