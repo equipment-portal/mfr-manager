@@ -1,3 +1,4 @@
+# Version 1.6.35: 管理用の一時停止履歴時刻補正を追加・補正時はローカルとGitHubレジューム状態へ同時保存
 # Version 1.6.34: 一時停止履歴をタイムラインへ保持・停止前実績を青、停止中の残り予定を赤で表示・状態表示を「一時停止中」へ変更
 # Version 1.6.33: 一時停止中の生産終了予定を「現在時刻＋残り成型時間」で随時更新
 # Version 1.6.32: MFR測定記録から10分後をOFF実績・状況表示の固定時刻にし、OFF確認未応答でも通知音と確認ダイアログを継続
@@ -1089,7 +1090,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.34"
+APP_VERSION = "1.6.35"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -3088,6 +3089,98 @@ with st.sidebar:
         # 履歴だけをリセットし、現在の実機電源状態記録は変更しない。
         st.session_state.acknowledged_alerts = []
         save_state(); st.rerun()
+
+    # V1.6.35: V1.6.34移行直後などに誤った一時停止時刻が
+    # 保存された場合の管理用補正。通常運用では触らない。
+    paused_machines = [
+        machine_name
+        for machine_name, saved_job in st.session_state.jobs.items()
+        if isinstance(saved_job, dict) and saved_job.get('status') == 'Paused'
+    ]
+
+    if paused_machines:
+        with st.expander("🕒 一時停止履歴の時刻補正（管理用）", expanded=False):
+            st.caption(
+                "現在一時停止中のLotについて、停止した時刻だけを補正します。"
+                " 生産数や測定記録は変更しません。"
+            )
+
+            correction_machine = st.selectbox(
+                "補正する成型機",
+                paused_machines,
+                key="pause_history_correction_machine",
+            )
+            correction_job = st.session_state.jobs.get(correction_machine)
+            current_paused_at = parse_history_datetime(
+                correction_job.get('paused_at') if isinstance(correction_job, dict) else None
+            )
+            if not isinstance(current_paused_at, datetime):
+                current_paused_at = datetime.utcnow() + timedelta(hours=9)
+
+            correction_date = st.date_input(
+                "一時停止日",
+                value=current_paused_at.date(),
+                key="pause_history_correction_date",
+            )
+            correction_time = st.time_input(
+                "一時停止時刻",
+                value=current_paused_at.time().replace(second=0, microsecond=0),
+                step=60,
+                key="pause_history_correction_time",
+            )
+
+            corrected_paused_at = datetime.combine(
+                correction_date,
+                correction_time,
+            )
+            st.caption(
+                f"補正後：{corrected_paused_at.strftime('%Y/%m/%d %H:%M')}"
+            )
+
+            if st.button(
+                "✅ この時刻に一時停止履歴を補正",
+                key="apply_pause_history_correction",
+            ):
+                correction_job = st.session_state.jobs.get(correction_machine)
+                if not isinstance(correction_job, dict) or correction_job.get('status') != 'Paused':
+                    st.error("対象の成型機は現在一時停止中ではありません。")
+                else:
+                    segments = correction_job.get('production_segments', [])
+                    last_pause_segment = None
+                    if isinstance(segments, list):
+                        for segment in reversed(segments):
+                            if isinstance(segment, dict) and segment.get('end_reason') == 'pause':
+                                last_pause_segment = segment
+                                break
+
+                    segment_start = None
+                    if isinstance(last_pause_segment, dict):
+                        segment_start = parse_history_datetime(last_pause_segment.get('start'))
+
+                    if isinstance(segment_start, datetime) and corrected_paused_at < segment_start:
+                        st.error(
+                            "補正時刻がこの稼働区間の開始時刻より前です。"
+                            " 稼働開始以降の時刻を指定してください。"
+                        )
+                    else:
+                        if isinstance(last_pause_segment, dict):
+                            last_pause_segment['end'] = corrected_paused_at
+
+                        correction_job['paused_at'] = corrected_paused_at
+                        correction_job['last_update'] = corrected_paused_at
+                        correction_job['active_segment_started_at'] = None
+
+                        # save_state()でローカルpickleとGitHub専用ブランチの
+                        # mfr_runtime_state.jsonを同時に更新する。
+                        save_state()
+                        st.session_state.pause_history_correction_notice = (
+                            f"✅ {correction_machine} の一時停止時刻を "
+                            f"{corrected_paused_at.strftime('%Y/%m/%d %H:%M')} に補正しました。"
+                        )
+                        st.rerun()
+
+    if st.session_state.get('pause_history_correction_notice'):
+        st.success(st.session_state.pop('pause_history_correction_notice'))
 
 # --- 事前計算ロジック ---
 now = (datetime.utcnow() + timedelta(hours=9))
