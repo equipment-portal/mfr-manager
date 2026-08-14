@@ -1,3 +1,4 @@
+# Version 1.6.36: 製品名プルダウンを英字・数字の自然順へ統一（製品マスター／生産開始／削除）
 # Version 1.6.35: 管理用の一時停止履歴時刻補正を追加・補正時はローカルとGitHubレジューム状態へ同時保存
 # Version 1.6.34: 一時停止履歴をタイムラインへ保持・停止前実績を青、停止中の残り予定を赤で表示・状態表示を「一時停止中」へ変更
 # Version 1.6.33: 一時停止中の生産終了予定を「現在時刻＋残り成型時間」で随時更新
@@ -70,8 +71,26 @@ import mimetypes
 import hashlib
 import struct
 import wave
+import re
 from streamlit_autorefresh import st_autorefresh
 import streamlit.components.v1 as components  # ★この1行を追加
+
+def natural_sort_key(value):
+    """
+    製品名を英字・数字の自然順で並べ替えるためのキー。
+    例: P2 < P10、A2 < A10。英字の大文字・小文字は区別しない。
+    """
+    parts = re.split(r"(\d+)", str(value))
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in parts
+    )
+
+
+def sorted_product_names(names):
+    """製品名一覧を自然順で返す。元のdict順序は変更しない。"""
+    return sorted(list(names), key=natural_sort_key)
+
 
 # --- GitHub保存・読み込みロジック ---
 # QRシステムと同じリポジトリに「mfr_products.json」という名前でマスターを保存します
@@ -1090,7 +1109,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.35"
+APP_VERSION = "1.6.36"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -3016,7 +3035,7 @@ with st.sidebar:
     st.subheader("📦 製品マスター管理")
     with st.expander("製品の登録・編集・削除", expanded=False):
         # 1. 編集対象の選択（新規か既存か）
-        product_options = ["✨ 新規登録"] + list(st.session_state.products.keys())
+        product_options = ["✨ 新規登録"] + sorted_product_names(st.session_state.products.keys())
         selected_prod = st.selectbox("📝 編集する製品を選択 (または新規登録)", product_options)
 
         # 2. 選択された製品のデータを読み込む
@@ -3062,7 +3081,7 @@ with st.sidebar:
         # 4. 削除ツール
         st.markdown("---")
         if st.session_state.products:
-            del_name = st.selectbox("削除する製品を選択", list(st.session_state.products.keys()), key="del_prod_sel")
+            del_name = st.selectbox("削除する製品を選択", sorted_product_names(st.session_state.products.keys()), key="del_prod_sel")
             if st.button("🗑️ 選択した製品を削除（クラウド同期）"):
                 del st.session_state.products[del_name]
                 save_state()
@@ -4713,7 +4732,11 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 unsafe_allow_html=True,
             )
             # ★その成型機用に登録された製品だけを抽出（※機種設定がない古いデータは全成型機に表示してエラー回避）
-            machine_products = [p_name for p_name, p_info in st.session_state.products.items() if p_info.get('machine', machine) == machine]
+            machine_products = sorted_product_names(
+                p_name
+                for p_name, p_info in st.session_state.products.items()
+                if p_info.get('machine', machine) == machine
+            )
             
             if not machine_products:
                 st.warning(f"⚠️ サイドバーから {machine} 用の製品マスターを登録してください。")
