@@ -1,3 +1,4 @@
+# Version 1.6.34: 一時停止履歴をタイムラインへ保持・停止前実績を青、停止中の残り予定を赤で表示・状態表示を「一時停止中」へ変更
 # Version 1.6.33: 一時停止中の生産終了予定を「現在時刻＋残り成型時間」で随時更新
 # Version 1.6.32: MFR測定記録から10分後をOFF実績・状況表示の固定時刻にし、OFF確認未応答でも通知音と確認ダイアログを継続
 # Version 1.6.31: MFR電源OFFを「実機OFF＋表示札記入」確認ダイアログへ統合／固定7時日常点検を廃止し電源ONごとの点検・記録確認へ変更
@@ -1088,7 +1089,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.33"
+APP_VERSION = "1.6.34"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -1189,6 +1190,108 @@ def save_state():
     # GitHub未設定・一時的な通信失敗でもローカル運用は継続する。
     if GITHUB_TOKEN:
         save_runtime_state_to_github(state_to_save)
+
+
+def ensure_job_timeline_history(job, reference_time=None):
+    """
+    1つのLotについて、生産の実稼働区間と現在の一時停止時刻を保持する。
+
+    V1.6.34以前の保存データには履歴がないため、初回だけ現在保持している
+    production_started_at / status から安全に補完する。以降の一時停止・再開は
+    production_segmentsへ実時刻を追加して、バージョン更新や再起動後も保持する。
+    戻り値は、互換データの補完を行った場合True。
+    """
+    if not isinstance(job, dict):
+        return False
+
+    changed = False
+    if not isinstance(reference_time, datetime):
+        reference_time = datetime.utcnow() + timedelta(hours=9)
+
+    segments = job.get('production_segments')
+    if not isinstance(segments, list):
+        segments = []
+        job['production_segments'] = segments
+        changed = True
+
+    # 古い保存形式や手修正データでもdatetimeへ戻せるよう正規化する。
+    normalized_segments = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            changed = True
+            continue
+        seg_start = parse_history_datetime(segment.get('start'))
+        seg_end = parse_history_datetime(segment.get('end'))
+        if not isinstance(seg_start, datetime) or not isinstance(seg_end, datetime):
+            changed = True
+            continue
+        if seg_end < seg_start:
+            seg_end = seg_start
+            changed = True
+        normalized_segments.append({
+            'start': seg_start,
+            'end': seg_end,
+            'end_reason': segment.get('end_reason', 'pause'),
+        })
+    if normalized_segments != segments:
+        job['production_segments'] = normalized_segments
+        segments = normalized_segments
+        changed = True
+
+    status = job.get('status')
+    started_at = parse_history_datetime(job.get('production_started_at'))
+    if not isinstance(started_at, datetime):
+        started_at = parse_history_datetime(job.get('last_update'))
+    if not isinstance(started_at, datetime):
+        started_at = reference_time
+
+    if status == 'Running':
+        active_start = parse_history_datetime(job.get('active_segment_started_at'))
+        if not isinstance(active_start, datetime):
+            # 旧版のLotでは過去の停止履歴を復元できないため、
+            # 現在保持している開始時刻から1本の区間として引き継ぐ。
+            active_start = started_at
+            job['active_segment_started_at'] = active_start
+            changed = True
+        if job.get('paused_at') is not None:
+            job['paused_at'] = None
+            changed = True
+
+    elif status == 'Paused':
+        paused_at = parse_history_datetime(job.get('paused_at'))
+        if not isinstance(paused_at, datetime):
+            # V1.6.33以前は停止時刻を保存していないため、移行時点を
+            # 初回の停止時刻として採用する。以降は実際の押下時刻を保存する。
+            paused_at = reference_time
+            job['paused_at'] = paused_at
+            changed = True
+
+        active_start = parse_history_datetime(job.get('active_segment_started_at'))
+        if isinstance(active_start, datetime):
+            if paused_at < active_start:
+                paused_at = active_start
+                job['paused_at'] = paused_at
+                changed = True
+            segments.append({
+                'start': active_start,
+                'end': paused_at,
+                'end_reason': 'pause',
+            })
+            job['active_segment_started_at'] = None
+            changed = True
+        elif not segments:
+            # 旧版の「すでに一時停止中」のLotだけ、開始～移行時刻を
+            # 1本の実績区間として残す。
+            segments.append({
+                'start': started_at,
+                'end': max(started_at, paused_at),
+                'end_reason': 'pause',
+            })
+            job['active_segment_started_at'] = None
+            changed = True
+
+    return changed
+
 
 def get_image_base64(path):
     with open(path, "rb") as image_file:
@@ -2895,6 +2998,16 @@ if 'pending_signboard_confirmation' not in st.session_state:
 if 'cost_saving_data' not in st.session_state:
     st.session_state.cost_saving_data = get_default_cost_saving_data()
 
+# V1.6.34: コード更新中の既存セッション／V1.6.33以前の保存データにも
+# 一時停止履歴フィールドを補完し、以降の停止・再開時刻を確実に保存する。
+_timeline_history_changed = False
+_timeline_migration_time = datetime.utcnow() + timedelta(hours=9)
+for _machine_name, _saved_job in st.session_state.jobs.items():
+    if ensure_job_timeline_history(_saved_job, _timeline_migration_time):
+        _timeline_history_changed = True
+if _timeline_history_changed:
+    save_state()
+
 # --- UI：サイドバー ---
 with st.sidebar:
     st.header("⚙️ システム管理")
@@ -4072,6 +4185,10 @@ def finalize_production_start_with_actual_power(power_is_on):
         'last_update': start_timestamp,
         'production_started_at': start_timestamp,
         'measurement_records': [],
+        # V1.6.34: 一時停止をまたいだ実稼働履歴をタイムラインに残す。
+        'production_segments': [],
+        'active_segment_started_at': start_timestamp,
+        'paused_at': None,
         'heat_ready_at': heat_ready_at,
         'waiting_for_mfr_power_on': waiting_for_mfr_power_on,
         'first_measure_due_at': first_measure_due_at,
@@ -4567,7 +4684,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 st.markdown(
                     '<div class="machine-status-badge machine-paused-badge">'
                     '<span class="machine-status-icon-circle">⏸</span>'
-                    '<span class="machine-status-label">一時停止</span></div>',
+                    '<span class="machine-status-label">一時停止中</span></div>',
                     unsafe_allow_html=True,
                 )
             else:
@@ -4597,10 +4714,47 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 with col_ctrl1:
                     if job['status'] == 'Running':
                         if st.button("⏸️ 一時停止", key=f"pause_main_{machine}"):
-                            job['current_qty'] = est_current; job['status'] = 'Paused'; save_state(); st.rerun()
+                            paused_at = datetime.utcnow() + timedelta(hours=9)
+                            job['current_qty'] = est_current
+
+                            # 実際に稼働していた区間を青い履歴として閉じる。
+                            active_start = parse_history_datetime(
+                                job.get('active_segment_started_at')
+                            )
+                            if not isinstance(active_start, datetime):
+                                active_start = parse_history_datetime(
+                                    job.get('production_started_at')
+                                )
+                            if not isinstance(active_start, datetime):
+                                active_start = job.get('last_update', paused_at)
+                            if not isinstance(active_start, datetime):
+                                active_start = paused_at
+
+                            segments = job.setdefault('production_segments', [])
+                            if paused_at < active_start:
+                                active_start = paused_at
+                            segments.append({
+                                'start': active_start,
+                                'end': paused_at,
+                                'end_reason': 'pause',
+                            })
+
+                            # current_qtyの基準時刻も停止時刻へ更新する。
+                            job['last_update'] = paused_at
+                            job['active_segment_started_at'] = None
+                            job['paused_at'] = paused_at
+                            job['status'] = 'Paused'
+                            save_state()
+                            st.rerun()
                     elif job['status'] == 'Paused':
                         if st.button("▶️ 再開", key=f"resume_main_{machine}"):
-                            job['last_update'] = (datetime.utcnow() + timedelta(hours=9)); job['status'] = 'Running'; save_state(); st.rerun()
+                            resumed_at = datetime.utcnow() + timedelta(hours=9)
+                            job['last_update'] = resumed_at
+                            job['active_segment_started_at'] = resumed_at
+                            job['paused_at'] = None
+                            job['status'] = 'Running'
+                            save_state()
+                            st.rerun()
                 with col_ctrl2:
                     if st.button("⏹️ 生産終了", key=f"stop_main_{machine}"):
                         # V1.6.30: 手動の［生産終了］は、未測定のMFRポイントが
@@ -4712,38 +4866,108 @@ st.header("📈 稼働・MFRスケジュール")
 
 timeline_data = []
 measurement_points = []
+pause_points = []
 
 for machine, job in st.session_state.jobs.items():
-    if job is None: continue
-    start_time = job['last_update']
-    if job['status'] == 'Completed':
-        end_time = job.get(
-            'production_ended_at',
-            datetime.utcnow() + timedelta(hours=9),
+    if job is None:
+        continue
+
+    ensure_job_timeline_history(job, now)
+
+    # V1.6.34: 過去の一時停止までに実際に稼働した区間を青で残す。
+    for segment in job.get('production_segments', []):
+        if not isinstance(segment, dict):
+            continue
+        seg_start = parse_history_datetime(segment.get('start'))
+        seg_end = parse_history_datetime(segment.get('end'))
+        if not isinstance(seg_start, datetime) or not isinstance(seg_end, datetime):
+            continue
+        if seg_end < seg_start:
+            seg_end = seg_start
+
+        timeline_data.append({
+            'Task': machine,
+            'Start': seg_start,
+            'End': seg_end,
+            'Status': 'Running',
+            'Targets': job.get('targets', []),
+        })
+        if segment.get('end_reason') == 'pause':
+            pause_points.append({
+                'Task': machine,
+                'Time': seg_end,
+            })
+
+    remaining_qty = max(
+        0,
+        job['total_qty'] - job['current_qty'],
+    )
+    remaining_duration = timedelta(
+        seconds=remaining_qty * job['cycle_time']
+    )
+
+    if job['status'] == 'Running':
+        # 現在の再開区間は、従来どおり終了予定まで青で表示する。
+        active_start = parse_history_datetime(
+            job.get('active_segment_started_at')
         )
+        if not isinstance(active_start, datetime):
+            active_start = job.get('last_update', now)
+        if not isinstance(active_start, datetime):
+            active_start = now
+
+        projected_end = job['last_update'] + remaining_duration
+        timeline_data.append({
+            'Task': machine,
+            'Start': active_start,
+            'End': max(active_start, projected_end),
+            'Status': 'Running',
+            'Targets': job.get('targets', []),
+        })
+
     elif job['status'] == 'Paused':
-        # V1.6.33: 一時停止中は生産数が進まないため、
-        # 「今この瞬間に再開した場合」の終了見込みを表示する。
-        # 停止している時間だけ終了予定も後ろへずれる。
-        remaining_qty = max(
-            0,
-            job['total_qty'] - job['current_qty'],
+        # 一時停止中は、過去の青い実績を残したまま、
+        # 「今この瞬間に再開した場合」の残り生産時間だけを赤で表示する。
+        projected_end = now + remaining_duration
+        timeline_data.append({
+            'Task': machine,
+            'Start': now,
+            'End': max(now, projected_end),
+            'Status': 'Remaining',
+            'Targets': job.get('targets', []),
+        })
+
+    elif job['status'] == 'Completed':
+        ended_at = job.get('production_ended_at', now)
+        active_start = parse_history_datetime(
+            job.get('active_segment_started_at')
         )
-        end_time = now + timedelta(
-            seconds=remaining_qty * job['cycle_time']
-        )
-    else:
-        end_time = job['last_update'] + timedelta(
-            seconds=(job['total_qty'] - job['current_qty']) * job['cycle_time']
-        )
-    timeline_data.append({'Task': machine, 'Start': start_time, 'End': end_time, 'Status': job['status'], 'Targets': job['targets']})
+        if isinstance(active_start, datetime):
+            timeline_data.append({
+                'Task': machine,
+                'Start': active_start,
+                'End': max(active_start, ended_at),
+                'Status': 'Completed',
+                'Targets': job.get('targets', []),
+            })
 
     for t in job['targets']:
         is_completed = t in job['completed']
 
         if is_completed:
-            # 完了済みマークは従来どおりの表示位置を維持する。
-            if (
+            # 実際の測定記録時刻が残っていれば、それを最優先で使用する。
+            measured_at = None
+            for record in job.get('measurement_records', []):
+                if (
+                    isinstance(record, dict)
+                    and record.get('target_qty') == t
+                ):
+                    measured_at = parse_history_datetime(record.get('measured_at'))
+                    if isinstance(measured_at, datetime):
+                        break
+            if isinstance(measured_at, datetime):
+                t_time = measured_at
+            elif (
                 job['status'] != 'Running'
                 or (t - job['current_qty']) <= 0
             ):
@@ -4760,13 +4984,10 @@ for machine, job in st.session_state.jobs.items():
                 )
             point_status = 'Completed'
         else:
-            # 未完了の黄色◆は通知と完全に同じ測定予定時刻を使う。
+            # 未完了の黄色◆は通知と同じ測定予定時刻を使う。
             t_time = calculate_planned_measurement_time(job, t)
-
-            # 一時停止中は測定予定時刻が確定しないので表示しない。
             if t_time is None:
                 continue
-
             point_status = 'Planned'
 
         measurement_points.append({
@@ -4777,6 +4998,8 @@ for machine, job in st.session_state.jobs.items():
             'Status': point_status,
         })
 
+# 今日より前の一時停止履歴も表示対象にする。
+# 空白の休日を無理に増やさず、データが存在する日だけfacet行として残す。
 today_start = datetime.combine(now.date(), dt_time.min)
 
 for b_start, b_end in on_blocks:
@@ -4794,9 +5017,9 @@ new_timeline_data = []
 overall_end_time = now + timedelta(hours=1) 
 
 for d in timeline_data:
-    if d['End'] < today_start: continue
-    if d['End'] > overall_end_time: overall_end_time = d['End']
-    curr_start = max(d['Start'], today_start)
+    if d['End'] > overall_end_time:
+        overall_end_time = d['End']
+    curr_start = d['Start']
     end_time = max(d['End'], curr_start)
 
     while curr_start.date() < end_time.date():
@@ -4809,8 +5032,8 @@ for d in timeline_data:
 
 new_measurement_points = []
 for pt in measurement_points:
-    if pt['Time'] < today_start: continue
-    if pt['Time'] > overall_end_time: overall_end_time = pt['Time']
+    if pt['Time'] > overall_end_time:
+        overall_end_time = pt['Time']
     new_measurement_points.append({'Task': pt['Task'], 'TimeDummy': time_to_dummy(pt['Time']), 'DateStr': get_date_str(pt['Time']), 'Target_Qty': pt['Target_Qty'], 'Targets': pt.get('Targets', []), 'Status': pt['Status']})
 
 if new_timeline_data:
@@ -4821,7 +5044,7 @@ if new_timeline_data:
     
     fig = px.timeline(
         df, x_start="StartDummy", x_end="EndDummy", y="Task", color="Status", facet_row="DateStr",
-        color_discrete_map={'Running': '#2563eb', 'Paused': '#d97706', 'Completed': '#0891b2', 'ON': '#dc2626'},
+        color_discrete_map={'Running': '#2563eb', 'Remaining': '#dc2626', 'Completed': '#0891b2', 'ON': '#dc2626'},
         facet_row_spacing=0.15,
         category_orders={"DateStr": unique_dates, "Task": ["MFR電源", "550t", "450t", "100t"]} 
     )
@@ -4937,6 +5160,50 @@ if new_timeline_data:
                     text=trace_planned_text, textposition='top center', textfont=dict(size=20, color='black', weight='bold'),
                     cliponaxis=False, hoverinfo='skip', showlegend=False 
                 ), row=row_idx, col=1)
+
+    # 一時停止した正確な時刻を、履歴行にオレンジの停止マークで残す。
+    # 再開後も同じLotが終了するまでは消さない。
+    if pause_points:
+        for facet_date in unique_dates:
+            row_idx = date_to_row[facet_date]
+            pause_in_facet = [
+                point for point in pause_points
+                if get_date_str(point['Time']) == facet_date
+            ]
+            if not pause_in_facet:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=[time_to_dummy(point['Time']) for point in pause_in_facet],
+                    y=[point['Task'] for point in pause_in_facet],
+                    mode='markers+text',
+                    marker=dict(
+                        color='#f59e0b',
+                        size=18,
+                        symbol='square',
+                        line=dict(width=3, color='black'),
+                    ),
+                    text=['一時停止' for _ in pause_in_facet],
+                    textposition='top center',
+                    textfont=dict(size=16, color='black', weight='bold'),
+                    cliponaxis=False,
+                    hovertemplate='%{text}<extra></extra>',
+                    showlegend=False,
+                ),
+                row=row_idx,
+                col=1,
+            )
+
+    # 凡例は現場で意味が分かる日本語へ置換する。
+    legend_name_map = {
+        'Running': '稼働・生産予定',
+        'Remaining': '一時停止中の残り予定',
+        'Completed': '生産終了',
+        'ON': 'MFR電源ON',
+    }
+    for trace in fig.data:
+        if trace.name in legend_name_map:
+            trace.name = legend_name_map[trace.name]
 
     fig.update_layout(
         height=max(700, len(unique_dates) * 350), margin=dict(t=120, b=50, l=100, r=50), showlegend=True,
