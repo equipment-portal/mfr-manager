@@ -1,3 +1,5 @@
+# Version 1.6.43: 成型中・一時停止中の製品情報（型番・生産数・サイクル）を大きな太文字へ強調表示
+# Version 1.6.42: 日常点検案内文を現場ルールに合わせて簡潔化・電源ON時の事前説明を削除
 # Version 1.6.40: 製品マスター保存後は新規登録・既存編集どちらも入力欄と既存製品選択を空欄へ自動リセット
 # Version 1.6.39: 製品マスターを常時新規登録用空欄表示にし、既存製品選択を保存ボタン直上へ移動・保存ボタンを統一
 # Version 1.6.37: 製品マスターの新規登録ボタンと既存製品編集プルダウンを分離し、操作モードを明確化
@@ -67,6 +69,7 @@ import pickle
 import os
 import base64
 import json
+import html
 import urllib.request
 import io
 import math
@@ -265,6 +268,7 @@ def _build_runtime_state_payload(state_dict):
         "pending_measurement_required_before_finish",
         "pending_production_finish_confirmation",
         "pending_signboard_confirmation",
+        "pending_daily_inspection",
         "mfr_power_is_on",
         "mfr_power_on_confirmed_at",
         "mfr_power_state_version",
@@ -1112,7 +1116,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.40"
+APP_VERSION = "1.6.43"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -1190,6 +1194,11 @@ def save_state():
         # 『実機OFF＋表示札記入』を一括確認するダイアログ待ち。
         'pending_signboard_confirmation': st.session_state.get(
             'pending_signboard_confirmation'
+        ),
+        # V1.6.41以降、日常点検は電源ON直後ではなく、
+        # 加熱完了後の最初のMFR測定タイミングで実施・記録する。
+        'pending_daily_inspection': st.session_state.get(
+            'pending_daily_inspection'
         ),
         # Cost Savingの生産履歴・電源実績・計算条件。
         'cost_saving_data': normalize_cost_saving_data(
@@ -2891,6 +2900,9 @@ if 'initialized' not in st.session_state:
             st.session_state.pending_signboard_confirmation = restored_off_dialog
         else:
             st.session_state.pending_signboard_confirmation = None
+        st.session_state.pending_daily_inspection = saved_state.get(
+            'pending_daily_inspection'
+        )
         local_cost_saving = normalize_cost_saving_data(
             saved_state.get('cost_saving_data')
         )
@@ -2932,6 +2944,7 @@ if 'initialized' not in st.session_state:
         st.session_state.pending_measurement_required_before_finish = None
         st.session_state.pending_production_finish_confirmation = None
         st.session_state.pending_signboard_confirmation = None
+        st.session_state.pending_daily_inspection = None
         st.session_state.cost_saving_data = (
             normalize_cost_saving_data(gh_cost_saving)
             if gh_cost_saving is not None
@@ -3018,6 +3031,8 @@ if 'pending_production_finish_confirmation' not in st.session_state:
     st.session_state.pending_production_finish_confirmation = None
 if 'pending_signboard_confirmation' not in st.session_state:
     st.session_state.pending_signboard_confirmation = None
+if 'pending_daily_inspection' not in st.session_state:
+    st.session_state.pending_daily_inspection = None
 if 'cost_saving_data' not in st.session_state:
     st.session_state.cost_saving_data = get_default_cost_saving_data()
 
@@ -3286,6 +3301,7 @@ with st.sidebar:
         st.session_state.pending_production_start = None
         st.session_state.pending_production_finish_confirmation = None
         st.session_state.pending_signboard_confirmation = None
+        st.session_state.pending_daily_inspection = None
         save_state(); st.rerun()
         
     if st.button("🔕 通知の確認履歴をリセット（テスト用）"):
@@ -3437,7 +3453,8 @@ def calculate_upcoming_measurements():
     """3台の成型機について、未完了のMFR測定予定だけを返す。
 
     V1.6.31以降、固定時刻の日常点検予定はここへ追加しない。
-    日常点検はMFR電源をONにするたび、その場で実施・記録する運用とする。
+    V1.6.41以降は、MFR電源ON後の加熱が完了した最初のMFR測定時に
+    日常点検も同時に実施し、記録シートへ記入する運用とする。
     """
     upcoming = []
 
@@ -3474,6 +3491,65 @@ def calculate_upcoming_measurements():
 
 valid_upcoming, all_upcoming = calculate_upcoming_measurements()
 
+
+def schedule_daily_inspection_for_current_power_cycle(power_on_at, source_id):
+    """
+    現在のMFR電源ONサイクルについて、加熱完了後に最初に到来する
+    MFR測定を日常点検の同時実施タイミングとして予約する。
+
+    日常点検は電源ON直後には実施せず、実際に測定可能温度へ到達した後の
+    最初のMFR測定と同じタイミングで行う。
+    """
+    if not isinstance(power_on_at, datetime):
+        return None
+
+    candidates = []
+    for machine_name, active_job in st.session_state.jobs.items():
+        if (
+            active_job is None
+            or active_job.get('status') != 'Running'
+        ):
+            continue
+
+        for target_qty in active_job.get('targets', []):
+            if target_qty in active_job.get('completed', []):
+                continue
+            est_time = calculate_planned_measurement_time(
+                active_job,
+                target_qty,
+            )
+            if not isinstance(est_time, datetime):
+                continue
+            candidates.append({
+                'machine': machine_name,
+                'target_qty': target_qty,
+                'est_time': est_time,
+                'job_id': active_job.get('job_id', machine_name),
+            })
+
+    if not candidates:
+        st.session_state.pending_daily_inspection = None
+        return None
+
+    first_measurement = min(
+        candidates,
+        key=lambda item: item['est_time'],
+    )
+
+    inspection = {
+        'id': (
+            f"INSPECTION_{source_id}_"
+            f"{first_measurement['job_id']}_"
+            f"{first_measurement['target_qty']}"
+        ),
+        'power_on_at': power_on_at,
+        'due_at': first_measurement['est_time'],
+        'machine': first_measurement['machine'],
+        'target_qty': first_measurement['target_qty'],
+        'job_id': first_measurement['job_id'],
+    }
+    st.session_state.pending_daily_inspection = inspection
+    return inspection
 
 
 def complete_mfr_measurement(machine, target_qty):
@@ -3725,6 +3801,30 @@ def get_next_power_action(reference_time):
 active_alerts = []
 
 # 1. MFR測定（予定時刻になったら、確認されるまでアラートを継続）
+# V1.6.41以降、電源ON後の最初の測定では日常点検・記録確認も同時に行う。
+pending_inspection = st.session_state.get('pending_daily_inspection')
+inspection_combined_alert_created = False
+
+# 生産数補正・一時停止/再開などで最初の測定予定が動いた場合は、
+# その測定がまだ未完了である限り、日常点検の案内時刻も同じ時刻へ追従させる。
+if isinstance(pending_inspection, dict):
+    for _inspection_pt in valid_upcoming:
+        _inspection_job = st.session_state.jobs.get(_inspection_pt['machine'])
+        _inspection_job_id = (
+            _inspection_job.get('job_id', _inspection_pt['machine'])
+            if isinstance(_inspection_job, dict)
+            else _inspection_pt['machine']
+        )
+        if (
+            pending_inspection.get('machine') == _inspection_pt['machine']
+            and pending_inspection.get('target_qty') == _inspection_pt['target_qty']
+            and pending_inspection.get('job_id') == _inspection_job_id
+        ):
+            if pending_inspection.get('due_at') != _inspection_pt['est_time']:
+                pending_inspection['due_at'] = _inspection_pt['est_time']
+                st.session_state.pending_daily_inspection = pending_inspection
+            break
+
 for pt in valid_upcoming:
     m_time = pt['est_time']
     if m_time <= now:
@@ -3736,14 +3836,19 @@ for pt in valid_upcoming:
         job_id = job.get('job_id', pt['machine'])
         alert_id_meas = f"MEAS_{job_id}_{pt['target_qty']}"
 
+        inspection_for_this_measurement = (
+            isinstance(pending_inspection, dict)
+            and pending_inspection.get('machine') == pt['machine']
+            and pending_inspection.get('target_qty') == pt['target_qty']
+            and pending_inspection.get('job_id') == job_id
+        )
+
         if alert_id_meas not in st.session_state.acknowledged_alerts:
             elapsed_from_due = now - m_time
 
             if elapsed_from_due >= timedelta(minutes=10):
                 # 測定予定から10分経っても記録されていない場合は、
                 # 「測定記録忘れ」を明確にした新しいフォロー通知へ切り替える。
-                # IDを別にすることで、通知音・自動スクロールも
-                # 10分後に改めて発生させる。
                 reminder_id = (
                     f"MEAS_REMINDER_{job_id}_{pt['target_qty']}"
                 )
@@ -3786,33 +3891,106 @@ for pt in valid_upcoming:
                         "電源OFFと表示札記入を確認してください。"
                     )
 
-                active_alerts.append({
-                    "id": reminder_id,
-                    "due": m_time + timedelta(minutes=10),
-                    "title": "⏰ MFR測定記録アラート",
-                    "message": (
+                if inspection_for_this_measurement:
+                    inspection_combined_alert_created = True
+                    title = "⏰ MFR測定・日常点検記録アラート"
+                    message = (
+                        f"{pt['machine']} 成型機（{meas_text}）の測定予定から"
+                        "10分経過しました。MFR測定と日常点検が完了している場合は、"
+                        "下の完了ボタンを押してください。 "
+                        f"{followup_action}"
+                        "<div style='margin-top:12px;padding:12px 14px;"
+                        "border:3px solid #b45309;background:#fff7d6;"
+                        "border-radius:8px;font-size:1.2rem;font-weight:900;"
+                        "color:#7c2d12;'>"
+                        "MFR測定と日常点検を行ってください。<br>"
+                        "<span style='display:inline-block;margin-top:8px;'>"
+                        "⚠️ 日常点検は、MFR測定器の電源を入れ直した場合、"
+                        "加熱完了後の最初のMFR測定時に行うルールです。<br>"
+                        "点検後は日常点検記録シートに記入してください。"
+                        "</span>"
+                        "</div>"
+                    )
+                    kind = "measurement_inspection"
+                else:
+                    title = "⏰ MFR測定記録アラート"
+                    message = (
                         f"{pt['machine']} 成型機（{meas_text}）の測定予定から"
                         "10分経過しました。測定が完了している場合は、"
                         "下の［測定済みとして記録］を押してください。 "
                         f"{followup_action}"
-                    ),
-                    "kind": "measurement",
+                    )
+                    kind = "measurement"
+
+                active_alerts.append({
+                    "id": reminder_id,
+                    "due": m_time + timedelta(minutes=10),
+                    "title": title,
+                    "message": message,
+                    "kind": kind,
                     "machine": pt['machine'],
                     "target_qty": pt['target_qty'],
                 })
             else:
-                active_alerts.append({
-                    "id": alert_id_meas,
-                    "due": m_time,
-                    "title": "🎯 MFR測定アラート",
-                    "message": (
-                        f"{pt['machine']} 成型機（{meas_text}）のMFR測定時刻です。"
-                        f" 予定時刻：{m_time.strftime('%m/%d %H:%M')}"
-                    ),
-                    "kind": "measurement",
-                    "machine": pt['machine'],
-                    "target_qty": pt['target_qty'],
-                })
+                if inspection_for_this_measurement:
+                    inspection_combined_alert_created = True
+                    active_alerts.append({
+                        "id": alert_id_meas,
+                        "due": m_time,
+                        "title": "🎯 MFR測定・日常点検アラート",
+                        "message": (
+                            f"{pt['machine']} 成型機（{meas_text}）のMFR測定時刻です。"
+                            f" 予定時刻：{m_time.strftime('%m/%d %H:%M')}"
+                            "<div style='margin-top:12px;padding:12px 14px;"
+                            "border:3px solid #b45309;background:#fff7d6;"
+                            "border-radius:8px;font-size:1.2rem;font-weight:900;"
+                            "color:#7c2d12;'>"
+                            "MFR測定と日常点検を行ってください。<br>"
+                            "<span style='display:inline-block;margin-top:8px;'>"
+                            "⚠️ 日常点検は、MFR測定器の電源を入れ直した場合、"
+                            "加熱完了後の最初のMFR測定時に行うルールです。<br>"
+                            "点検後は日常点検記録シートに記入してください。"
+                            "</span>"
+                            "</div>"
+                        ),
+                        "kind": "measurement_inspection",
+                        "machine": pt['machine'],
+                        "target_qty": pt['target_qty'],
+                    })
+                else:
+                    active_alerts.append({
+                        "id": alert_id_meas,
+                        "due": m_time,
+                        "title": "🎯 MFR測定アラート",
+                        "message": (
+                            f"{pt['machine']} 成型機（{meas_text}）のMFR測定時刻です。"
+                            f" 予定時刻：{m_time.strftime('%m/%d %H:%M')}"
+                        ),
+                        "kind": "measurement",
+                        "machine": pt['machine'],
+                        "target_qty": pt['target_qty'],
+                    })
+
+# 測定ボタンを成型機カード側から先に押した場合でも、
+# 日常点検・記録確認だけは未応答のまま残し、確認されるまで通知音を継続する。
+if isinstance(pending_inspection, dict):
+    inspection_due_at = pending_inspection.get('due_at')
+    if (
+        isinstance(inspection_due_at, datetime)
+        and inspection_due_at <= now
+        and not inspection_combined_alert_created
+    ):
+        active_alerts.append({
+            "id": pending_inspection.get('id', 'DAILY_INSPECTION'),
+            "due": inspection_due_at,
+            "title": "📋 日常点検・記録アラート",
+            "message": (
+                "MFR電源ON後の加熱が完了しています。"
+                "最初のMFR測定と同じタイミングで日常点検を行い、"
+                "日常点検記録シートにその都度記入してください。"
+            ),
+            "kind": "inspection",
+        })
 
 # 2. MFR電源ON
 # on_blocks の終了時刻には、最終MFR測定の所要時間10分を含めています。
@@ -3868,18 +4046,11 @@ for b_start, b_off in on_blocks:
             active_alerts.append({
                 "id": alert_id_on,
                 "due": b_start,
-                "title": "🔥 MFR電源ON・日常点検",
+                "title": "🔥 MFR電源ONアラート",
                 "message": (
-                    f"MFR測定器の電源をONにしてください。"
+                    f"MFR測定器の電源をONにして、加熱を開始してください。"
                     f" 対象：{target_machine}／"
-                    f"最初の予定：{first_measure_time.strftime('%m/%d %H:%M')}"
-                    "<div style='margin-top:12px;padding:12px 14px;"
-                    "border:3px solid #b45309;background:#fff7d6;"
-                    "border-radius:8px;font-size:1.2rem;font-weight:900;"
-                    "color:#7c2d12;'>"
-                    "⚠️ 電源ON時には必ず日常点検を行い、<br>"
-                    "日常点検記録シートにその都度記入してください。"
-                    "</div>"
+                    f"最初のMFR測定予定：{first_measure_time.strftime('%m/%d %H:%M')}"
                 ),
                 "kind": "power_on",
             })
@@ -4061,8 +4232,12 @@ if active_alerts:
 
     if primary_alert["kind"] == "measurement":
         ack_button_text = "✅ 測定済みとして記録（通知音を停止）"
+    elif primary_alert["kind"] == "measurement_inspection":
+        ack_button_text = "✅ はい、MFR測定・日常点検・記録を完了しました"
+    elif primary_alert["kind"] == "inspection":
+        ack_button_text = "✅ はい、日常点検・記録を完了しました"
     elif primary_alert["kind"] == "power_on":
-        ack_button_text = "✅ はい、電源ON・日常点検・記録を完了しました"
+        ack_button_text = "✅ はい、MFR電源をONにしました"
     else:
         ack_button_text = "✅ 確認しました（通知音を停止）"
 
@@ -4073,12 +4248,16 @@ if active_alerts:
     ):
         cost_saving_changed = False
 
-        if primary_alert["kind"] == "measurement":
+        if primary_alert["kind"] in ("measurement", "measurement_inspection"):
             # 測定通知の確認＝実際のMFR測定完了として同時に記録する。
             complete_mfr_measurement(
                 primary_alert["machine"],
                 primary_alert["target_qty"],
             )
+
+        if primary_alert["kind"] in ("measurement_inspection", "inspection"):
+            # 日常点検は状態表示には残さず、このONサイクル分の確認待ちだけ解除する。
+            st.session_state.pending_daily_inspection = None
 
         st.session_state.acknowledged_alerts.append(primary_alert["id"])
 
@@ -4114,6 +4293,12 @@ if active_alerts:
                     waiting_job['waiting_for_mfr_power_on'] = False
                     waiting_job['first_measure_due_at'] = None
 
+            # 日常点検は電源ON直後ではなく、加熱完了後に最初に到来する
+            # MFR測定と同じタイミングで通知する。
+            schedule_daily_inspection_for_current_power_cycle(
+                power_on_confirmed_at,
+                primary_alert["id"],
+            )
 
         save_state()
         if cost_saving_changed:
@@ -4492,6 +4677,15 @@ def finalize_production_start_with_actual_power(power_is_on):
         'completed': completed,
         'status': 'Running',
     }
+
+    # PC側ではOFFだったが、開始確認で「実機はON」と初めて同期した場合も、
+    # このONサイクルの最初のMFR測定時に日常点検を案内する。
+    # すでにPC側もONだった場合は同じONサイクルなので、新たな点検予約は作らない。
+    if power_is_on and not previous_power_is_on:
+        schedule_daily_inspection_for_current_power_cycle(
+            power_on_at,
+            f"ACTUAL_ON_{machine}_{start_timestamp.strftime('%Y%m%d%H%M%S')}",
+        )
 
     st.session_state.pending_production_start = None
     save_state()
@@ -4996,9 +5190,20 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 )
 
             p_name = job.get('product_name', '設定なし')
-            st.caption(
-                f"{p_name} ｜ {job['total_qty']}個 ｜ "
-                f"{job['cycle_time']:g}秒/個"
+            safe_product_name = html.escape(str(p_name))
+            st.markdown(
+                f"""
+                <div style="margin:0.35rem 0 0.55rem 0;line-height:1.35;">
+                    <span style="font-size:1.32rem;font-weight:900;color:#1f2937;">
+                        {safe_product_name}
+                    </span>
+                    <span style="font-size:1.08rem;font-weight:800;color:#475569;">
+                        &nbsp;｜&nbsp; {job['total_qty']}個
+                        &nbsp;｜&nbsp; {job['cycle_time']:g}秒/個
+                    </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
             if job['status'] == 'Running':
