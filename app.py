@@ -1,3 +1,5 @@
+# Version 1.6.45: 生産中のサイクル補正を製品マスターへ同期・製品マスター削除前の確認ダイアログを追加
+# Version 1.6.44: 生産中の生産予定数補正を追加・製品マスター変更を稼働中Lotへ即時反映し各予定/金額/状況を再計算
 # Version 1.6.43: 成型中・一時停止中の製品情報（型番・生産数・サイクル）を大きな太文字へ強調表示
 # Version 1.6.42: 日常点検案内文を現場ルールに合わせて簡潔化・電源ON時の事前説明を削除
 # Version 1.6.40: 製品マスター保存後は新規登録・既存編集どちらも入力欄と既存製品選択を空欄へ自動リセット
@@ -1116,7 +1118,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.43"
+APP_VERSION = "1.6.45"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -2564,6 +2566,144 @@ def get_measurement_text(num_targets, current_target_qty, targets):
     return str(current_target_qty)
 
 
+def build_measurement_targets(total_qty, measurement_count):
+    """生産予定数とマスターの測定回数から、始・中・終の対象個数を作る。"""
+    total_qty = max(1, int(total_qty))
+    measurement_count = 2 if int(measurement_count) == 2 else 3
+    if measurement_count == 2:
+        return [1, total_qty]
+    if total_qty <= 2:
+        return [1, total_qty]
+    return [1, total_qty // 2, total_qty]
+
+
+def estimate_job_current_qty(job, reference_time=None):
+    """旧サイクルで現在の推定生産数を確定し、実績個数を減らさず返す。"""
+    if not isinstance(job, dict):
+        return 0
+    try:
+        current_qty = max(0, int(job.get('current_qty', 0) or 0))
+    except (TypeError, ValueError):
+        current_qty = 0
+    if job.get('status') != 'Running':
+        return current_qty
+    if not isinstance(reference_time, datetime):
+        reference_time = datetime.utcnow() + timedelta(hours=9)
+    last_update = job.get('last_update')
+    try:
+        cycle_time = float(job.get('cycle_time', 0) or 0)
+    except (TypeError, ValueError):
+        cycle_time = 0.0
+    if not isinstance(last_update, datetime) or cycle_time <= 0:
+        return current_qty
+    elapsed_sec = max(0.0, (reference_time - last_update).total_seconds())
+    estimated = int(current_qty + elapsed_sec / cycle_time)
+    try:
+        total_qty = max(0, int(job.get('total_qty', 0) or 0))
+    except (TypeError, ValueError):
+        total_qty = 0
+    if current_qty > total_qty:
+        return current_qty
+    return min(estimated, total_qty)
+
+
+def calculate_job_measurement_due_time(job, target):
+    """jobの現在値からMFR測定予定時刻を計算する共通ロジック。"""
+    if job is None or job.get('status') != 'Running':
+        return None
+    targets = list(job.get('targets', []))
+    first_target = targets[0] if targets else None
+    first_measure_due_at = job.get('first_measure_due_at')
+    if target == first_target and isinstance(first_measure_due_at, datetime):
+        est_time = first_measure_due_at
+    else:
+        remaining_qty = target - int(job.get('current_qty', 0) or 0)
+        last_update = job.get('last_update')
+        if not isinstance(last_update, datetime):
+            return None
+        if remaining_qty <= 0:
+            est_time = last_update
+        else:
+            est_time = last_update + timedelta(seconds=remaining_qty * float(job.get('cycle_time', 0) or 0))
+    heat_ready_at = job.get('heat_ready_at')
+    if isinstance(heat_ready_at, datetime) and est_time < heat_ready_at:
+        est_time = heat_ready_at
+    return est_time
+
+
+def apply_planning_settings_to_job(job, *, total_qty=None, cycle_time=None, measurement_count=None, product_name=None, reference_time=None):
+    """稼働中/一時停止中Lotへ計画変更を反映し、未完了予定を再計算可能な状態へ更新する。"""
+    if not isinstance(job, dict):
+        return False
+    if not isinstance(reference_time, datetime):
+        reference_time = datetime.utcnow() + timedelta(hours=9)
+
+    old_targets = list(job.get('targets', []))
+    old_completed = set(job.get('completed', []))
+    old_completed_labels = {
+        get_measurement_text(len(old_targets), t, old_targets)
+        for t in old_targets if t in old_completed
+    }
+
+    pending_inspection = st.session_state.get('pending_daily_inspection')
+    pending_inspection_label = None
+    if (isinstance(pending_inspection, dict)
+        and pending_inspection.get('job_id') == job.get('job_id')
+        and pending_inspection.get('target_qty') in old_targets):
+        pending_inspection_label = get_measurement_text(
+            len(old_targets), pending_inspection.get('target_qty'), old_targets
+        )
+
+    if job.get('status') == 'Running':
+        job['current_qty'] = estimate_job_current_qty(job, reference_time)
+        job['last_update'] = reference_time
+
+    if product_name is not None:
+        job['product_name'] = str(product_name)
+    if total_qty is not None:
+        job['total_qty'] = max(1, int(total_qty))
+    if cycle_time is not None:
+        job['cycle_time'] = max(0.1, float(cycle_time))
+
+    if measurement_count is None:
+        measurement_count = job.get('measurement_count')
+        if measurement_count not in (2, 3):
+            measurement_count = 3 if len(old_targets) >= 3 else 2
+    measurement_count = 2 if int(measurement_count) == 2 else 3
+    job['measurement_count'] = measurement_count
+
+    new_targets = build_measurement_targets(job['total_qty'], measurement_count)
+    label_to_new_target = {
+        get_measurement_text(len(new_targets), t, new_targets): t for t in new_targets
+    }
+    job['targets'] = new_targets
+    job['completed'] = [
+        t for t in new_targets
+        if get_measurement_text(len(new_targets), t, new_targets) in old_completed_labels
+    ]
+
+    for record in job.get('measurement_records', []):
+        if isinstance(record, dict):
+            label = str(record.get('label', ''))
+            if label in label_to_new_target:
+                record['target_qty'] = label_to_new_target[label]
+
+    if isinstance(pending_inspection, dict) and pending_inspection_label:
+        new_target = label_to_new_target.get(pending_inspection_label)
+        if new_target is not None:
+            pending_inspection['target_qty'] = new_target
+            due = calculate_job_measurement_due_time(job, new_target)
+            if isinstance(due, datetime):
+                pending_inspection['due_at'] = due
+            st.session_state.pending_daily_inspection = pending_inspection
+
+    if not all(t in job.get('completed', []) for t in new_targets):
+        pending_finish = st.session_state.get('pending_production_finish_confirmation')
+        if isinstance(pending_finish, dict) and pending_finish.get('job_id') == job.get('job_id'):
+            st.session_state.pending_production_finish_confirmation = None
+    return True
+
+
 def format_remaining_time(minutes):
     """残り時間を読みやすい「○時間○分」形式へ変換する。"""
     total_minutes = max(0, int(minutes))
@@ -3257,18 +3397,44 @@ with st.sidebar:
                 if edit_mode and clean_name != edit_target:
                     del st.session_state.products[edit_target]
 
-                st.session_state.products[clean_name] = {
+                new_master_info = {
                     'machine': clean_machine,
                     'qty': clean_qty,
                     'cycle': clean_cycle,
                     'measurements': int(p_meas),
                 }
+                st.session_state.products[clean_name] = new_master_info
+
+                active_synced_count = 0
+                if edit_mode:
+                    sync_now = datetime.utcnow() + timedelta(hours=9)
+                    for _machine_name, _active_job in st.session_state.jobs.items():
+                        if (
+                            isinstance(_active_job, dict)
+                            and _active_job.get('status') in ('Running', 'Paused')
+                            and _active_job.get('product_name') == edit_target
+                        ):
+                            apply_planning_settings_to_job(
+                                _active_job,
+                                total_qty=clean_qty,
+                                cycle_time=clean_cycle,
+                                measurement_count=int(p_meas),
+                                product_name=clean_name,
+                                reference_time=sync_now,
+                            )
+                            active_synced_count += 1
+
                 save_state()
                 save_products_to_github(st.session_state.products)
 
                 action_text = "更新" if edit_mode else "新規登録"
+                synced_text = (
+                    f" 稼働中/一時停止中の{active_synced_count}台にも反映しました。"
+                    if active_synced_count > 0 else ""
+                )
                 st.session_state.product_master_feedback = (
                     f"✓ 「{clean_name} ({clean_machine})」をクラウドに{action_text}しました！"
+                    f"{synced_text}"
                 )
 
                 # 新規登録・既存製品の編集どちらでも、保存成功後は
@@ -3279,15 +3445,87 @@ with st.sidebar:
 
         # 4. 削除ツール
         st.markdown("---")
+
+        def render_product_delete_confirmation_dialog():
+            """製品マスターを実際に削除する直前の最終確認。"""
+            pending_name = st.session_state.get('pending_product_delete')
+            if not pending_name or pending_name not in st.session_state.products:
+                st.session_state.pending_product_delete = None
+                st.info("削除対象の製品が見つかりません。")
+                return
+
+            active_machines = [
+                machine_name
+                for machine_name, active_job in st.session_state.jobs.items()
+                if isinstance(active_job, dict)
+                and active_job.get('status') in ('Running', 'Paused')
+                and active_job.get('product_name') == pending_name
+            ]
+
+            st.markdown(f"### 「{pending_name}」を削除しますか？")
+            st.warning(
+                "製品マスターから削除すると、次回の生産開始時にはこの製品を選択できなくなります。"
+            )
+            if active_machines:
+                st.info(
+                    "現在 " + "・".join(active_machines) +
+                    " で生産中／一時停止中です。現在のLotは停止せず、そのまま継続します。"
+                )
+
+            col_delete, col_cancel = st.columns(2)
+            with col_delete:
+                if st.button(
+                    "🗑️ はい、削除します",
+                    type="primary",
+                    use_container_width=True,
+                    key="confirm_product_master_delete",
+                ):
+                    del st.session_state.products[pending_name]
+                    st.session_state.pending_product_delete = None
+                    st.session_state.product_master_reset_after_save = True
+                    st.session_state.product_master_reload_edit_name = None
+                    st.session_state.pop('del_prod_sel', None)
+                    save_state()
+                    save_products_to_github(st.session_state.products)
+                    st.session_state.product_master_feedback = (
+                        f"✓ 「{pending_name}」を製品マスターから削除しました。"
+                    )
+                    st.rerun()
+
+            with col_cancel:
+                if st.button(
+                    "キャンセル",
+                    use_container_width=True,
+                    key="cancel_product_master_delete",
+                ):
+                    st.session_state.pending_product_delete = None
+                    st.rerun()
+
+        if hasattr(st, "dialog"):
+            show_product_delete_confirmation_dialog = st.dialog(
+                "🗑️ 製品削除の確認",
+                width="small",
+            )(render_product_delete_confirmation_dialog)
+        elif hasattr(st, "experimental_dialog"):
+            show_product_delete_confirmation_dialog = st.experimental_dialog(
+                "🗑️ 製品削除の確認",
+            )(render_product_delete_confirmation_dialog)
+        else:
+            show_product_delete_confirmation_dialog = (
+                render_product_delete_confirmation_dialog
+            )
+
         if st.session_state.products:
-            del_name = st.selectbox("削除する製品を選択", sorted_product_names(st.session_state.products.keys()), key="del_prod_sel")
+            del_name = st.selectbox(
+                "削除する製品を選択",
+                sorted_product_names(st.session_state.products.keys()),
+                key="del_prod_sel",
+            )
             if st.button("🗑️ 選択した製品を削除（クラウド同期）"):
-                del st.session_state.products[del_name]
-                save_state()
-                save_products_to_github(st.session_state.products) # ★削除もGitHubに同期！
-                
-                st.info(f"✓ 「{del_name}」をクラウドから削除しました。")
-                st.rerun()
+                st.session_state.pending_product_delete = del_name
+
+        if st.session_state.get('pending_product_delete'):
+            show_product_delete_confirmation_dialog()
 
     st.markdown("---")
     st.subheader("🔧 リセット・テスト用ツール")
@@ -3406,47 +3644,8 @@ now = (datetime.utcnow() + timedelta(hours=9))
 today_date = now.date()
 
 def calculate_planned_measurement_time(job, target):
-    """
-    未完了のMFR測定予定時刻を一元計算する。
-
-    生産数・サイクルタイムから求めた時刻が早くても、
-    生産スタートから60分の加熱完了時刻より前にはしない。
-    通知、電源スケジュール、タイムラインの黄色◆で共通使用する。
-    """
-    if job is None or job.get('status') != 'Running':
-        return None
-
-    # 実機MFRがすでに加熱済みの状態でゼロから生産開始した場合は、
-    # 「始」測定を生産開始直後に実施できる。
-    first_measure_due_at = job.get('first_measure_due_at')
-    first_target = job['targets'][0] if job.get('targets') else None
-
-    if (
-        target == first_target
-        and isinstance(first_measure_due_at, datetime)
-    ):
-        est_time = first_measure_due_at
-    else:
-        remaining_qty = target - job['current_qty']
-
-        if remaining_qty <= 0:
-            est_time = job['last_update']
-        else:
-            est_time = (
-                job['last_update']
-                + timedelta(
-                    seconds=remaining_qty * job['cycle_time']
-                )
-            )
-
-    heat_ready_at = job.get('heat_ready_at')
-    if (
-        isinstance(heat_ready_at, datetime)
-        and est_time < heat_ready_at
-    ):
-        est_time = heat_ready_at
-
-    return est_time
+    """未完了のMFR測定予定時刻を一元計算する。"""
+    return calculate_job_measurement_due_time(job, target)
 
 
 def calculate_upcoming_measurements():
@@ -3567,11 +3766,7 @@ def complete_mfr_measurement(machine, target_qty):
 
     # 稼働中なら、測定を完了した時点までの推定生産数を確定する。
     if job.get('status') == 'Running':
-        elapsed_sec = (now_jst - job['last_update']).total_seconds()
-        job['current_qty'] = min(
-            int(job['current_qty'] + (elapsed_sec / job['cycle_time'])),
-            job['total_qty'],
-        )
+        job['current_qty'] = estimate_job_current_qty(job, now_jst)
         job['last_update'] = now_jst
 
     if target_qty not in job['completed']:
@@ -4662,6 +4857,7 @@ def finalize_production_start_with_actual_power(power_is_on):
         'product_name': pending['product_name'],
         'total_qty': pending['total_qty'],
         'cycle_time': pending['cycle_time'],
+        'measurement_count': int(pending.get('measurement_count', len(targets))),
         'current_qty': current_qty,
         'last_update': start_timestamp,
         'production_started_at': start_timestamp,
@@ -4705,14 +4901,7 @@ def finish_production(machine, job_id):
     # 途中終了にも対応するため、予定生産数へ強制的に合わせない。
     # 稼働中なら終了ボタンを押した時点までの推定生産数を確定する。
     if job.get('status') == 'Running':
-        elapsed_sec = max(
-            0.0,
-            (ended_at - job['last_update']).total_seconds(),
-        )
-        job['current_qty'] = min(
-            int(job['current_qty'] + (elapsed_sec / job['cycle_time'])),
-            job['total_qty'],
-        )
+        job['current_qty'] = estimate_job_current_qty(job, ended_at)
         job['last_update'] = ended_at
     # 履歴保存用に生産終了状態を確定するが、画面上には終了状態を残さない。
     # Cost Savingへ履歴を保存した直後に、その成型機を停止中（job=None）へ戻す。
@@ -5128,8 +5317,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                     f"MFR測定 {meas_count}回"
                 )
                 
-                if meas_count == 2: targets = [1, total_qty]
-                else: targets = [1, total_qty] if total_qty <= 2 else [1, total_qty // 2, total_qty]
+                targets = build_measurement_targets(total_qty, meas_count)
 
                 current_qty = 0
                 completed = []
@@ -5158,6 +5346,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                         'product_name': product_name,
                         'total_qty': total_qty,
                         'cycle_time': cycle_time,
+                        'measurement_count': int(meas_count),
                         'current_qty': current_qty,
                         'targets': list(targets),
                         'completed': list(completed),
@@ -5207,10 +5396,11 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
             )
 
             if job['status'] == 'Running':
-                elapsed_sec = ((datetime.utcnow() + timedelta(hours=9)) - job['last_update']).total_seconds()
-                est_current = min(int(job['current_qty'] + (elapsed_sec / job['cycle_time'])), job['total_qty'])
+                est_current = estimate_job_current_qty(
+                    job, datetime.utcnow() + timedelta(hours=9)
+                )
             else:
-                est_current = job['current_qty']
+                est_current = int(job.get('current_qty', 0) or 0)
                 
             st.metric("推定生産数", f"{est_current} / {job['total_qty']}")
             
@@ -5338,32 +5528,139 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
         job = machine_data[machine]['job']
         est_current = machine_data[machine]['est_current']
         
-        with st.expander("🔧 生産数・サイクル補正", expanded=False):
+        with st.expander("🔧 生産数・生産予定数・サイクル補正", expanded=False):
             adjust_qty_value = est_current if job is not None else 0
             adjust_cycle_value = float(job['cycle_time']) if job is not None else 30.0
-            
+
+            master_plan_qty = 0
+            master_measurements = None
+            if job is not None:
+                _master_info = st.session_state.products.get(job.get('product_name', ''), {})
+                if isinstance(_master_info, dict):
+                    try:
+                        master_plan_qty = int(_master_info.get('qty', job.get('total_qty', 0)))
+                    except (TypeError, ValueError):
+                        master_plan_qty = int(job.get('total_qty', 0) or 0)
+                    try:
+                        master_measurements = int(_master_info.get(
+                            'measurements', job.get('measurement_count', len(job.get('targets', [])))
+                        ))
+                    except (TypeError, ValueError):
+                        master_measurements = None
+                else:
+                    master_plan_qty = int(job.get('total_qty', 0) or 0)
+
             st.markdown("**生産数の補正**")
-            new_qty = st.number_input("現在の実際の個数", min_value=0, max_value=job['total_qty'] if job is not None else 999999, value=adjust_qty_value, step=1, key=f"adj_qty_{machine}")
+            new_qty = st.number_input(
+                "現在の実際の個数", min_value=0, max_value=999999,
+                value=adjust_qty_value, step=1, key=f"adj_qty_{machine}"
+            )
             if st.button("💾 個数を上書き更新", key=f"update_qty_{machine}"):
                 if job is not None:
-                    job['current_qty'] = new_qty
-                    job['last_update'] = (datetime.utcnow() + timedelta(hours=9))
+                    job['current_qty'] = int(new_qty)
+                    job['last_update'] = datetime.utcnow() + timedelta(hours=9)
                     save_state(); st.rerun()
                 else:
                     st.warning("稼働していません。")
-            
+
             st.markdown("---")
-            
-            st.markdown("**サイクルの補正**")
-            new_cycle = st.number_input("サイクルタイム微調整(秒)", min_value=1.0, value=adjust_cycle_value, step=0.1, key=f"adj_cyc_{machine}")
-            if st.button("💾 サイクルのみ変更", key=f"update_cyc_{machine}"):
+            st.markdown("**生産予定数の補正**")
+            if job is not None:
+                plan_widget_key = f"adj_plan_qty_{machine}"
+                plan_snapshot_key = f"_adj_plan_master_snapshot_{machine}"
+                # 新しいLotへ切り替わった場合、同じ製品・同じマスター値でも
+                # 前Lotで手入力した予定数を持ち越さず、必ずマスター値から開始する。
+                plan_snapshot = (job.get('job_id'), master_plan_qty)
+                if st.session_state.get(plan_snapshot_key) != plan_snapshot:
+                    st.session_state[plan_widget_key] = max(1, master_plan_qty)
+                    st.session_state[plan_snapshot_key] = plan_snapshot
+                new_plan_qty = st.number_input(
+                    "生産予定数", min_value=1, max_value=999999, step=1,
+                    key=plan_widget_key,
+                    help="初期値は製品マスターの生産数です。ここでの変更は現在のLotだけに反映し、製品マスター自体は変更しません。",
+                )
+            else:
+                new_plan_qty = st.number_input(
+                    "生産予定数", min_value=1, max_value=999999, value=1,
+                    step=1, key=f"adj_plan_qty_{machine}", disabled=True,
+                )
+
+            if st.button("💾 生産予定数を変更", key=f"update_plan_qty_{machine}"):
                 if job is not None:
-                    job['current_qty'] = est_current 
-                    job['cycle_time'] = new_cycle
-                    job['last_update'] = (datetime.utcnow() + timedelta(hours=9))
+                    apply_planning_settings_to_job(
+                        job,
+                        total_qty=int(new_plan_qty),
+                        measurement_count=(master_measurements if master_measurements in (2, 3) else job.get('measurement_count')),
+                        reference_time=datetime.utcnow() + timedelta(hours=9),
+                    )
                     save_state(); st.rerun()
                 else:
                     st.warning("稼働していません。")
+
+            st.markdown("---")
+            st.markdown("**サイクルの補正**")
+            new_cycle = st.number_input(
+                "サイクルタイム微調整(秒)", min_value=1.0,
+                value=adjust_cycle_value, step=0.1, key=f"adj_cyc_{machine}"
+            )
+            if st.button("💾 サイクル変更（マスターにも反映）", key=f"update_cyc_{machine}"):
+                if job is not None:
+                    sync_now = datetime.utcnow() + timedelta(hours=9)
+                    product_name = str(job.get('product_name', '')).strip()
+                    new_cycle_value = float(new_cycle)
+
+                    # 生産中の補正値を製品マスターにも反映する。
+                    # マスター更新後は同じ製品の稼働中／一時停止中Lotにも同期し、
+                    # 各Lotは変更直前までの推定個数を旧サイクルで確定してから
+                    # 新しいサイクルへ切り替える。
+                    master_updated = False
+                    synced_count = 0
+                    if product_name in st.session_state.products:
+                        st.session_state.products[product_name]['cycle'] = new_cycle_value
+                        master_updated = True
+
+                        for active_job in st.session_state.jobs.values():
+                            if (
+                                isinstance(active_job, dict)
+                                and active_job.get('status') in ('Running', 'Paused')
+                                and active_job.get('product_name') == product_name
+                            ):
+                                apply_planning_settings_to_job(
+                                    active_job,
+                                    cycle_time=new_cycle_value,
+                                    reference_time=sync_now,
+                                )
+                                synced_count += 1
+                    else:
+                        # マスターが削除済み等の場合でも、現在Lotの補正自体は行う。
+                        apply_planning_settings_to_job(
+                            job,
+                            cycle_time=new_cycle_value,
+                            reference_time=sync_now,
+                        )
+
+                    save_state()
+                    if master_updated:
+                        save_products_to_github(st.session_state.products)
+                        st.session_state[f'cycle_adjust_feedback_{machine}'] = (
+                            f"✓ サイクルを {new_cycle_value:g}秒 に変更し、"
+                            f"製品マスターと稼働中Lot {synced_count}件へ反映しました。"
+                        )
+                    else:
+                        st.session_state[f'cycle_adjust_feedback_{machine}'] = (
+                            f"✓ 現在のLotのサイクルを {new_cycle_value:g}秒 に変更しました。"
+                            " 製品マスターに同名製品がないため、マスター更新は行っていません。"
+                        )
+                    st.rerun()
+                else:
+                    st.warning("稼働していません。")
+
+            cycle_feedback = st.session_state.pop(
+                f'cycle_adjust_feedback_{machine}',
+                None,
+            )
+            if cycle_feedback:
+                st.success(cycle_feedback)
 st.markdown("---")
 
 # --- UI：全体可視化グラフ ---
