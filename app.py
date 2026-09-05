@@ -1,3 +1,4 @@
+# Version 1.6.46: 途中開始の現在生産数を空欄初期表示・生産数補正欄を推定現在数へ自動追従
 # Version 1.6.45: 生産中のサイクル補正を製品マスターへ同期・製品マスター削除前の確認ダイアログを追加
 # Version 1.6.44: 生産中の生産予定数補正を追加・製品マスター変更を稼働中Lotへ即時反映し各予定/金額/状況を再計算
 # Version 1.6.43: 成型中・一時停止中の製品情報（型番・生産数・サイクル）を大きな太文字へ強調表示
@@ -1118,7 +1119,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.45"
+APP_VERSION = "1.6.46"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -4884,6 +4885,10 @@ def finalize_production_start_with_actual_power(power_is_on):
         )
 
     st.session_state.pending_production_start = None
+    # 次回、同じ製品を途中開始する場合でも入力欄を空欄から始められるよう、
+    # 今回の開始時入力をクリアする。
+    st.session_state.pop(f"cur_{machine}", None)
+    st.session_state.pop(f"_start_qty_context_{machine}", None)
     save_state()
     st.rerun()
 
@@ -5322,13 +5327,30 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                 current_qty = 0
                 completed = []
                 with st.expander("途中から開始する場合", expanded=False):
-                    current_qty = st.number_input(
+                    start_qty_widget_key = f"cur_{machine}"
+                    start_qty_context_key = f"_start_qty_context_{machine}"
+                    start_qty_context = (product_name, int(total_qty))
+
+                    # V1.6.46: 途中開始の入力欄は毎回「空欄」から開始する。
+                    # 同じ製品を表示したままの10秒自動更新では入力途中の値を保持する。
+                    if st.session_state.get(start_qty_context_key) != start_qty_context:
+                        st.session_state.pop(start_qty_widget_key, None)
+                        st.session_state[start_qty_context_key] = start_qty_context
+
+                    current_qty_input = st.number_input(
                         "現在の生産数",
                         min_value=0,
                         max_value=int(total_qty),
-                        value=0,
+                        value=None,
                         step=1,
-                        key=f"cur_{machine}",
+                        key=start_qty_widget_key,
+                        placeholder="現在の生産数を入力",
+                    )
+                    # 空欄のまま生産開始した場合は、従来どおり0個から開始する。
+                    current_qty = (
+                        int(current_qty_input)
+                        if current_qty_input is not None
+                        else 0
                     )
                     default_completed = [t for t in targets if t <= current_qty]
                     completed = st.multiselect(
@@ -5551,14 +5573,59 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                     master_plan_qty = int(job.get('total_qty', 0) or 0)
 
             st.markdown("**生産数の補正**")
-            new_qty = st.number_input(
-                "現在の実際の個数", min_value=0, max_value=999999,
-                value=adjust_qty_value, step=1, key=f"adj_qty_{machine}"
-            )
+            qty_widget_key = f"adj_qty_{machine}"
+            qty_snapshot_key = f"_adj_qty_auto_snapshot_{machine}"
+
+            if job is not None:
+                # V1.6.46: 補正欄は、その時点の推定生産数を初期値として表示する。
+                # 10秒自動更新中も、作業者がまだ手入力していない間だけ推定値へ追従する。
+                qty_job_id = job.get('job_id')
+                qty_auto_value = int(adjust_qty_value)
+                qty_snapshot = st.session_state.get(qty_snapshot_key)
+                qty_widget_value = st.session_state.get(qty_widget_key)
+
+                if (
+                    not isinstance(qty_snapshot, dict)
+                    or qty_snapshot.get('job_id') != qty_job_id
+                ):
+                    # 新しいLotでは、以前のLotの入力値を持ち越さない。
+                    st.session_state[qty_widget_key] = qty_auto_value
+                    st.session_state[qty_snapshot_key] = {
+                        'job_id': qty_job_id,
+                        'auto_value': qty_auto_value,
+                    }
+                elif qty_widget_value == qty_snapshot.get('auto_value'):
+                    # 未編集なら、現在の推定生産数へ自動追従する。
+                    st.session_state[qty_widget_key] = qty_auto_value
+                    st.session_state[qty_snapshot_key] = {
+                        'job_id': qty_job_id,
+                        'auto_value': qty_auto_value,
+                    }
+
+                new_qty = st.number_input(
+                    "現在の実際の個数", min_value=0, max_value=999999,
+                    step=1, key=qty_widget_key
+                )
+            else:
+                # 停止中は前Lotの補正値を残さない。
+                st.session_state[qty_widget_key] = 0
+                st.session_state.pop(qty_snapshot_key, None)
+                new_qty = st.number_input(
+                    "現在の実際の個数", min_value=0, max_value=999999,
+                    step=1, key=qty_widget_key, disabled=True
+                )
+
             if st.button("💾 個数を上書き更新", key=f"update_qty_{machine}"):
                 if job is not None:
+                    corrected_at = datetime.utcnow() + timedelta(hours=9)
                     job['current_qty'] = int(new_qty)
-                    job['last_update'] = datetime.utcnow() + timedelta(hours=9)
+                    job['last_update'] = corrected_at
+                    # 更新直後から再び推定値への自動追従を開始できるよう、
+                    # 今回の補正値を自動同期の基準値として保存する。
+                    st.session_state[qty_snapshot_key] = {
+                        'job_id': job.get('job_id'),
+                        'auto_value': int(new_qty),
+                    }
                     save_state(); st.rerun()
                 else:
                     st.warning("稼働していません。")
