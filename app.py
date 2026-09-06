@@ -1,3 +1,5 @@
+# Version 1.6.49: 予定生産数到達後の最終MFR測定完了で生産を自動終了・通常時の生産終了確認を不要化
+# Version 1.6.48: 途中開始のMFR測定済み選択を累積化（中→始+中／終→始+中+終）・不整合選択を開始前に正規化
 # Version 1.6.47: 生産終了後も成型機ごとに直前生産製品を保持し、次回の製品選択初期値へ復元
 # Version 1.6.46: 途中開始の現在生産数を空欄初期表示・生産数補正欄を推定現在数へ自動追従
 # Version 1.6.45: 生産中のサイクル補正を製品マスターへ同期・製品マスター削除前の確認ダイアログを追加
@@ -1122,7 +1124,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.47"
+APP_VERSION = "1.6.49"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -2585,6 +2587,39 @@ def build_measurement_targets(total_qty, measurement_count):
     return [1, total_qty // 2, total_qty]
 
 
+def normalize_completed_measurements(targets, selected):
+    """途中開始時の測定済み選択を、工程順に抜けのない累積状態へ正規化する。
+
+    例（3回測定）:
+      中のみ選択 -> 始・中
+      終のみ選択 -> 始・中・終
+    2回測定では、終を選ぶと始・終になる。
+    """
+    ordered_targets = list(targets or [])
+    if not ordered_targets:
+        return []
+
+    selected_values = set(selected or [])
+    selected_indexes = [
+        index
+        for index, target in enumerate(ordered_targets)
+        if target in selected_values
+    ]
+    if not selected_indexes:
+        return []
+
+    furthest_index = max(selected_indexes)
+    return ordered_targets[:furthest_index + 1]
+
+
+def sync_completed_measurement_selection(widget_key, targets):
+    """測定済みmultiselect変更直後に、前工程も自動選択する。"""
+    selected = st.session_state.get(widget_key, [])
+    normalized = normalize_completed_measurements(targets, selected)
+    if list(selected or []) != normalized:
+        st.session_state[widget_key] = normalized
+
+
 def estimate_job_current_qty(job, reference_time=None):
     """旧サイクルで現在の推定生産数を確定し、実績個数を減らさず返す。"""
     if not isinstance(job, dict):
@@ -3798,7 +3833,8 @@ def complete_mfr_measurement(machine, target_qty):
     MFR測定を完了として記録する。
 
     通知画面の確認ボタンと成型機パネルの手動ボタンで共通使用する。
-    最終測定まで完了した場合は、生産終了確認ダイアログを予約する。
+    予定生産数へ到達した状態で最終測定まで完了した場合は、
+    そのLotを自動的に生産終了する。予定数未到達なら従来どおり確認する。
     """
     job = st.session_state.jobs.get(machine)
     if job is None or target_qty not in job.get('targets', []):
@@ -3859,11 +3895,51 @@ def complete_mfr_measurement(machine, target_qty):
     )
 
     if all_measurements_completed:
-        # 最終測定＝自動的に生産終了とはせず、作業者へ確認する。
-        st.session_state.pending_production_finish_confirmation = {
-            'machine': machine,
-            'job_id': job.get('job_id'),
-        }
+        # V1.6.49:
+        # 予定生産数まで到達して最後（終）のMFR測定を完了した時点で、
+        # 通常のLotは作業者に［生産終了］を押させず自動的に停止中へ戻す。
+        # 最終測定を予定数より前に手動記録した特殊ケースだけは、
+        # 誤終了防止のため従来どおり「生産も終了ですか？」を確認する。
+        try:
+            current_qty = int(job.get('current_qty', 0) or 0)
+        except (TypeError, ValueError):
+            current_qty = 0
+        try:
+            total_qty = max(1, int(job.get('total_qty', 0) or 0))
+        except (TypeError, ValueError):
+            total_qty = 1
+
+        if current_qty >= total_qty:
+            ended_at = now_jst
+            job['status'] = 'Completed'
+            job['production_ended_at'] = ended_at
+            archive_production_job(
+                machine,
+                job,
+                ended_at,
+                'final_measurement_auto',
+            )
+
+            # 次回も同じ製品を連続生産しやすいよう、直前製品を保持する。
+            if job.get('product_name'):
+                st.session_state.last_selected_products[machine] = job.get(
+                    'product_name'
+                )
+
+            st.session_state.pending_production_finish_confirmation = None
+            st.session_state.pending_measurement_required_before_finish = None
+            st.session_state.jobs[machine] = None
+
+            # 生産実績はこの時点で確定する。MFR電源OFF確認は
+            # pending_power_off_* を残しているため、従来どおり別途継続する。
+            save_state()
+            sync_cost_saving_to_github()
+            save_state()
+        else:
+            st.session_state.pending_production_finish_confirmation = {
+                'machine': machine,
+                'job_id': job.get('job_id'),
+            }
 
     return all_measurements_completed
 
@@ -4781,7 +4857,12 @@ def finalize_production_start_with_actual_power(power_is_on):
     machine = pending['machine']
     current_qty = int(pending['current_qty'])
     targets = list(pending['targets'])
-    completed = list(pending['completed'])
+    # V1.6.48: 旧画面状態や想定外の入力で「中だけ」「終だけ」のような
+    # 飛び越し選択が残っていても、開始確定時に必ず累積状態へ正規化する。
+    completed = normalize_completed_measurements(
+        targets,
+        pending.get('completed', []),
+    )
 
     previous_power_is_on = bool(
         st.session_state.get('mfr_power_is_on', False)
@@ -4934,6 +5015,10 @@ def finalize_production_start_with_actual_power(power_is_on):
     # 今回の開始時入力をクリアする。
     st.session_state.pop(f"cur_{machine}", None)
     st.session_state.pop(f"_start_qty_context_{machine}", None)
+    # 測定済み選択もLot終了後まで持ち越さない。
+    # 次のLotでは、現在生産数に応じた初期状態から安全に開始する。
+    st.session_state.pop(f"comp_sel_{machine}", None)
+    st.session_state.pop(f"_comp_sel_context_{machine}", None)
     save_state()
     st.rerun()
 
@@ -5418,15 +5503,46 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                         else 0
                     )
                     default_completed = [t for t in targets if t <= current_qty]
+                    completed_widget_key = f"comp_sel_{machine}"
+                    completed_context_key = f"_comp_sel_context_{machine}"
+                    completed_context = (
+                        product_name,
+                        tuple(targets),
+                        int(current_qty),
+                    )
+
+                    # V1.6.48: 製品または途中開始個数が変わった時だけ、
+                    # その時点の生産数から測定済み初期値を作り直す。
+                    # 10秒自動更新だけでは作業者の手動選択を上書きしない。
+                    if st.session_state.get(completed_context_key) != completed_context:
+                        st.session_state[completed_widget_key] = normalize_completed_measurements(
+                            targets,
+                            default_completed,
+                        )
+                        st.session_state[completed_context_key] = completed_context
+
                     completed = st.multiselect(
                         "測定済み",
                         options=targets,
-                        default=default_completed,
-                        format_func=lambda x: f"{x}個目",
-                        key=f"comp_sel_{machine}",
+                        format_func=lambda x: (
+                            f"{get_measurement_text(len(targets), x, targets)}（{x}個目）"
+                        ),
+                        key=completed_widget_key,
+                        on_change=sync_completed_measurement_selection,
+                        args=(completed_widget_key, tuple(targets)),
+                        help=(
+                            "中を選ぶと始も、終を選ぶとそれ以前の測定も自動的に選択されます。"
+                        ),
                     )
 
                 if st.button("▶️ 生産開始", key=f"start_btn_{machine}"):
+                    # 念のため開始ボタン側でも累積状態へ正規化する。
+                    # これにより旧バージョン由来の「中だけ」等が残っていても安全に開始できる。
+                    completed_for_start = normalize_completed_measurements(
+                        targets,
+                        completed,
+                    )
+
                     # 実際のMFR電源状態を確認してからジョブを確定する。
                     st.session_state.pending_production_start = {
                         'machine': machine,
@@ -5436,7 +5552,7 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                         'measurement_count': int(meas_count),
                         'current_qty': current_qty,
                         'targets': list(targets),
-                        'completed': list(completed),
+                        'completed': list(completed_for_start),
                         'start_timestamp': (
                             datetime.utcnow() + timedelta(hours=9)
                         ),
