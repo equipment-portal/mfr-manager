@@ -1,3 +1,4 @@
+# Version 1.6.50: MFR電源ONアラートの次回測定表記を「始／中／終」に応じて動的表示
 # Version 1.6.49: 予定生産数到達後の最終MFR測定完了で生産を自動終了・通常時の生産終了確認を不要化
 # Version 1.6.48: 途中開始のMFR測定済み選択を累積化（中→始+中／終→始+中+終）・不整合選択を開始前に正規化
 # Version 1.6.47: 生産終了後も成型機ごとに直前生産製品を保持し、次回の製品選択初期値へ復元
@@ -1124,7 +1125,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.49"
+APP_VERSION = "1.6.50"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -4334,6 +4335,19 @@ for b_start, b_off in on_blocks:
             first_measure_time = first_measure['est_time']
             target_machine = first_measure['machine']
 
+            # V1.6.50: 電源ON後に次に行う測定が「始・中・終」のどれかを
+            # 実際の未完了測定ポイントから判定し、ONアラートへ明示する。
+            first_measure_targets = list(first_measure.get('Targets', []))
+            first_measure_label = get_measurement_text(
+                len(first_measure_targets),
+                first_measure['target_qty'],
+                first_measure_targets,
+            )
+            if first_measure_label in ('始', '中', '終'):
+                next_measurement_caption = f"{first_measure_label}のMFR測定予定"
+            else:
+                next_measurement_caption = "次のMFR測定予定"
+
             first_job = st.session_state.jobs.get(target_machine)
             first_job_id = (
                 first_job.get('job_id', target_machine)
@@ -4346,6 +4360,7 @@ for b_start, b_off in on_blocks:
             )
         else:
             first_measure_time = b_start + timedelta(minutes=60)
+            next_measurement_caption = "次のMFR測定予定"
             on_context = b_start.strftime('%Y%m%d_%H%M%S')
 
         # 同じ時刻の過去テスト履歴と衝突しないよう、
@@ -4363,7 +4378,7 @@ for b_start, b_off in on_blocks:
                 "message": (
                     f"MFR測定器の電源をONにして、加熱を開始してください。"
                     f" 対象：{target_machine}／"
-                    f"最初のMFR測定予定：{first_measure_time.strftime('%m/%d %H:%M')}"
+                    f"{next_measurement_caption}：{first_measure_time.strftime('%m/%d %H:%M')}"
                 ),
                 "kind": "power_on",
             })
