@@ -1,3 +1,4 @@
+# Version 1.6.47: 生産終了後も成型機ごとに直前生産製品を保持し、次回の製品選択初期値へ復元
 # Version 1.6.46: 途中開始の現在生産数を空欄初期表示・生産数補正欄を推定現在数へ自動追従
 # Version 1.6.45: 生産中のサイクル補正を製品マスターへ同期・製品マスター削除前の確認ダイアログを追加
 # Version 1.6.44: 生産中の生産予定数補正を追加・製品マスター変更を稼働中Lotへ即時反映し各予定/金額/状況を再計算
@@ -275,6 +276,8 @@ def _build_runtime_state_payload(state_dict):
         "mfr_power_is_on",
         "mfr_power_on_confirmed_at",
         "mfr_power_state_version",
+        # V1.6.47: 成型機ごとの直前生産製品をコード更新・再起動後も保持する。
+        "last_selected_products",
     ]
 
     saved_at = state_dict.get("state_saved_at")
@@ -1119,7 +1122,7 @@ logo_path = "logo.png"
 icon_path = "icon.ico" 
 st.set_page_config(page_title="MFR電源管理システム", page_icon=icon_path, layout="wide")
 
-APP_VERSION = "1.6.46"
+APP_VERSION = "1.6.47"
 
 # 10秒ごとに自動更新（Excelの後ろでも通知時刻を早く検出）
 AUTO_REFRESH_MS = 10_000
@@ -1215,6 +1218,10 @@ def save_state():
         ),
         # V1.6.0以降の電源状態管理。
         'mfr_power_state_version': 2,
+        # V1.6.47: 成型機ごとの直前生産製品。生産終了後の製品選択初期値に使用する。
+        'last_selected_products': dict(
+            st.session_state.get('last_selected_products', {})
+        ),
         # ローカル／クラウドのどちらが新しい状態か判定するための保存時刻。
         'state_saved_at': datetime.utcnow() + timedelta(hours=9),
     }
@@ -3074,6 +3081,15 @@ if 'initialized' not in st.session_state:
             st.session_state.mfr_power_is_on = False
             st.session_state.mfr_power_on_confirmed_at = None
 
+        # V1.6.47: 成型機ごとの直前生産製品を復元する。
+        restored_last_products = saved_state.get('last_selected_products', {})
+        if not isinstance(restored_last_products, dict):
+            restored_last_products = {}
+        st.session_state.last_selected_products = {
+            machine_name: restored_last_products.get(machine_name)
+            for machine_name in ('100t', '450t', '550t')
+        }
+
         # ★GitHubのデータがあれば最優先、なければローカルデータ
         st.session_state.products = gh_products if gh_products is not None else saved_state.get('products', {})
     else:
@@ -3093,6 +3109,9 @@ if 'initialized' not in st.session_state:
         )
         st.session_state.mfr_power_is_on = False
         st.session_state.mfr_power_on_confirmed_at = None
+        st.session_state.last_selected_products = {
+            '100t': None, '450t': None, '550t': None
+        }
         default_products = {
             'サンプル製品A': {'machine': '100t', 'qty': 500, 'cycle': 60.0, 'measurements': 2},
             'サンプル製品B': {'machine': '450t', 'qty': 1000, 'cycle': 30.0, 'measurements': 3}
@@ -3176,6 +3195,28 @@ if 'pending_daily_inspection' not in st.session_state:
     st.session_state.pending_daily_inspection = None
 if 'cost_saving_data' not in st.session_state:
     st.session_state.cost_saving_data = get_default_cost_saving_data()
+if 'last_selected_products' not in st.session_state or not isinstance(
+    st.session_state.last_selected_products, dict
+):
+    st.session_state.last_selected_products = {
+        '100t': None, '450t': None, '550t': None
+    }
+else:
+    for _machine_name in ('100t', '450t', '550t'):
+        st.session_state.last_selected_products.setdefault(_machine_name, None)
+
+# V1.6.47: 旧保存データからの移行時、稼働中Lotの製品を直前生産製品として補完する。
+_last_product_migration_changed = False
+for _machine_name, _saved_job in st.session_state.jobs.items():
+    if (
+        isinstance(_saved_job, dict)
+        and _saved_job.get('product_name')
+        and not st.session_state.last_selected_products.get(_machine_name)
+    ):
+        st.session_state.last_selected_products[_machine_name] = _saved_job.get('product_name')
+        _last_product_migration_changed = True
+if _last_product_migration_changed:
+    save_state()
 
 # V1.6.34: コード更新中の既存セッション／V1.6.33以前の保存データにも
 # 一時停止履歴フィールドを補完し、以降の停止・再開時刻を確実に保存する。
@@ -4884,6 +4925,10 @@ def finalize_production_start_with_actual_power(power_is_on):
             f"ACTUAL_ON_{machine}_{start_timestamp.strftime('%Y%m%d%H%M%S')}",
         )
 
+    # V1.6.47: 実際に生産開始した製品を成型機ごとに記憶する。
+    # 生産終了後、同じ製品が製品マスターに残っていれば選択欄へ復元する。
+    st.session_state.last_selected_products[machine] = pending['product_name']
+
     st.session_state.pending_production_start = None
     # 次回、同じ製品を途中開始する場合でも入力欄を空欄から始められるよう、
     # 今回の開始時入力をクリアする。
@@ -4918,6 +4963,9 @@ def finish_production(machine, job_id):
         ended_at,
         'final_measurement_confirmed',
     )
+    # V1.6.47: 終了した製品を次回の製品選択初期値として保持する。
+    if job.get('product_name'):
+        st.session_state.last_selected_products[machine] = job.get('product_name')
     st.session_state.pending_production_finish_confirmation = None
     st.session_state.jobs[machine] = None
     save_state()
@@ -5276,6 +5324,8 @@ for machine_name, saved_job in list(st.session_state.jobs.items()):
             ended_at,
             'legacy_completed_auto_clear',
         )
+        if saved_job.get('product_name'):
+            st.session_state.last_selected_products[machine_name] = saved_job.get('product_name')
         st.session_state.jobs[machine_name] = None
         legacy_completed_cleared = True
 
@@ -5313,7 +5363,22 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
             if not machine_products:
                 st.warning(f"⚠️ サイドバーから {machine} 用の製品マスターを登録してください。")
             else:
-                product_name = st.selectbox("製品名を選択", machine_products, key=f"prod_sel_{machine}")
+                # V1.6.47: 前回この成型機で実際に生産した製品を初期選択へ戻す。
+                # 停止中に作業者が別製品を選んだ後は、その入力を10秒自動更新でも維持する。
+                product_widget_key = f"prod_sel_{machine}"
+                remembered_product = st.session_state.last_selected_products.get(machine)
+                current_widget_product = st.session_state.get(product_widget_key)
+                if current_widget_product not in machine_products:
+                    if remembered_product in machine_products:
+                        st.session_state[product_widget_key] = remembered_product
+                    else:
+                        st.session_state.pop(product_widget_key, None)
+
+                product_name = st.selectbox(
+                    "製品名を選択",
+                    machine_products,
+                    key=product_widget_key,
+                )
                 prod_info = st.session_state.products[product_name]
                 total_qty, cycle_time, meas_count = prod_info['qty'], prod_info['cycle'], prod_info['measurements']
                 
@@ -5496,6 +5561,9 @@ for idx, machine in enumerate(['100t', '450t', '550t']):
                         if pending_finish and pending_finish.get('machine') == machine:
                             st.session_state.pending_production_finish_confirmation = None
                         st.session_state.pending_measurement_required_before_finish = None
+                        # V1.6.47: 手動終了でも直前製品を次回の初期選択へ保持する。
+                        if job.get('product_name'):
+                            st.session_state.last_selected_products[machine] = job.get('product_name')
                         st.session_state.jobs[machine] = None
                         save_state()
                         sync_cost_saving_to_github()
